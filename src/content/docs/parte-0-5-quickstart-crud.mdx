@@ -41,6 +41,8 @@ El recurso principal es `TaskItem`:
 
 ### Requisitos
 
+Vas a instalar y usar varias **herramientas de línea de comandos (CLI**, de *Command-Line Interface*): programas que controlas escribiendo instrucciones en una terminal, en vez de hacer clic en botones de una interfaz gráfica. Cada una de las siguientes es, en el fondo, una de esas herramientas: `dotnet` (la instala el SDK de .NET), `node` y `npm` (los instala Node.js), y `ng` (lo instala un paquete llamado `@angular/cli`, como vas a ver más abajo).
+
 Antes de continuar, comprueba qué tienes instalado. Si alguno de estos comandos falla o imprime una versión distinta a la esperada, sigue las instrucciones de instalación correspondientes más abajo.
 
 <CodeBlock lang="bash" title="Comprobación rápida">
@@ -84,6 +86,8 @@ source ~/.bashrc
 ```
 </CodeBlock>
 
+**SDK** significa *Software Development Kit*: incluye el compilador, el *runtime* (lo mínimo para **ejecutar** una aplicación ya construida) y las herramientas de línea de comandos (`dotnet build`, `dotnet run`, `dotnet add`...) que necesitas para **crear** una. Si solo instalaras el runtime, podrías ejecutar una API .NET ya compilada por otra persona, pero no compilar la tuya — por eso este curso te pide instalar el SDK completo.
+
 Confirma con `dotnet --version` — debe imprimir algo como `8.0.4xx`. Si tienes varias versiones instaladas y quieres verlas todas, usa `dotnet --list-sdks`.
 
 #### Node.js 20 LTS
@@ -112,11 +116,13 @@ nvm use 20.18.0
 
 - **Instalador oficial, cualquier plataforma**: descarga la versión **LTS** desde [nodejs.org](https://nodejs.org).
 
-Confirma con `node --version` (debe empezar con `v20` o superior) y `npm --version` (viene incluido con Node, no se instala aparte).
+`npm` (*Node Package Manager*) viene incluido con Node, no se instala aparte — es el programa que descarga librerías escritas por otras personas (`npm install <paquete>`) y ejecuta los scripts definidos en `package.json` (`npm start`, `npm run build`...). Para .NET vas a usar el equivalente — NuGet, a través de `dotnet add package` — en el paso 1.
+
+Confirma con `node --version` (debe empezar con `v20` o superior) y `npm --version`.
 
 #### Angular CLI
 
-Con Node ya instalado:
+Angular CLI es un paquete de npm como cualquier otro, solo que en vez de una librería instala un **programa ejecutable**: al instalarlo con `-g` (global), tu terminal gana un comando nuevo llamado `ng` — así que a partir de aquí vas a escribir `ng new`, `ng serve`, `ng generate`, nunca `angular-cli algo`.
 
 <CodeBlock lang="bash" title="Terminal">
 ```bash
@@ -196,6 +202,8 @@ cd ..
 ```
 </CodeBlock>
 
+Cada `dotnet add package <nombre>` descarga un **paquete de NuGet** — el registro de librerías de .NET, el equivalente exacto del npm que acabas de usar para instalar Angular CLI — y lo añade como referencia dentro de `Taskboard.Api.csproj` (el archivo XML que lista, entre otras cosas, qué paquetes usa el proyecto).
+
 Son tres piezas distintas, y vale la pena distinguirlas:
 
 - **`Microsoft.EntityFrameworkCore.Sqlite`** es el *proveedor*: la pieza que sabe traducir las operaciones de EF Core al SQL específico de SQLite. Cada motor de base de datos necesita su propio proveedor — en la parte 4 vas a sustituir este paquete por `Npgsql.EntityFrameworkCore.PostgreSQL` sin cambiar ninguna otra línea de código.
@@ -253,6 +261,8 @@ public sealed record TaskResponse(
 ```
 </CodeBlock>
 
+`record` es un tipo de C# pensado para datos inmutables: escribir `public sealed record CreateTaskRequest(string Title);` genera automáticamente el constructor, la comparación por valor (dos records son "iguales" si sus datos coinciden, no solo si son el mismo objeto en memoria) y una representación en texto legible — todo lo que tendrías que escribir a mano con una `class` tradicional. Es la elección natural para contratos que solo transportan datos entre capas, sin comportamiento propio.
+
 La respuesta pública no tiene por qué coincidir con la entidad de EF Core. Esa pequeña separación evita acoplar tu API a futuras decisiones de persistencia.
 
 ## 3. Configura EF Core y SQLite
@@ -286,6 +296,8 @@ public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options)
 }
 ```
 </CodeBlock>
+
+`public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options) : DbContext(options)` usa **constructores primarios** (C# 12): los parámetros entre paréntesis junto al nombre de la clase reemplazan escribir un constructor y un campo privado por separado. Y nunca vas a escribir `new TaskDbContext(...)` en ningún lado — quién construye esta clase, y cuándo, es exactamente lo que verás en el siguiente paso.
 
 En `appsettings.json`, configura la conexión con un archivo local. En producción sustituirás esta cadena por una variable de entorno.
 
@@ -416,7 +428,12 @@ public partial class Program { }
 ```
 </CodeBlock>
 
-Hay tres detalles que vale la pena observar:
+Antes de los detalles puntuales, dos conceptos que se repiten en **cada** endpoint y que vale la pena nombrar:
+
+- **Inyección de dependencias (DI).** Fíjate que en `(TaskDbContext database, CancellationToken cancellationToken) => { ... }` nunca escribes `new TaskDbContext(...)` — `database` simplemente aparece como parámetro, ya listo para usar. Esto es DI: le dijiste al framework, con `builder.Services.AddDbContext<TaskDbContext>(...)`, *cómo* construir un `TaskDbContext` cuando alguien lo necesite. ASP.NET Core inspecciona los parámetros de cada handler, reconoce que pide un `TaskDbContext`, y te entrega una instancia ya configurada — una nueva por cada petición HTTP. No lo pasas a mano por ningún lado; el framework lo resuelve por ti a partir del tipo declarado. Vas a ver la misma idea, con otro nombre (`inject()`), del lado de Angular en el paso 7.
+- **`async`/`await` y `CancellationToken`.** Marcar un método como `async` y usar `await` dentro le permite al servidor seguir atendiendo otras peticiones mientras espera algo lento —aquí, una consulta a la base de datos— en lugar de bloquear un hilo sin hacer nada mientras tanto. `CancellationToken` es una señal que ASP.NET Core te pasa automáticamente y que se activa si el cliente cierra la conexión antes de que termines de responder, para que puedas abandonar el trabajo a medio hacer en vez de completarlo igual sin que nadie vaya a leer el resultado.
+
+Y tres detalles más puntuales que vale la pena observar:
 
 1. `AsNoTracking()` hace explícito que el listado es de solo lectura.
 2. `Results.Created` devuelve el recurso creado y su URL en el encabezado `Location`.
@@ -464,6 +481,8 @@ export interface CreateTaskRequest {
 }
 ```
 </CodeBlock>
+
+Una `interface` de TypeScript no genera ningún código — desaparece por completo al compilar a JavaScript. Solo le describe a tu editor y al compilador qué forma debe tener un objeto, para que te avisen antes de ejecutar nada si accedes a una propiedad que no existe o le pasas un tipo equivocado a una función.
 
 Crea un proxy para que el navegador llame a `/api` sin problemas de CORS durante el desarrollo:
 
@@ -525,6 +544,12 @@ export class TaskApiService {
 }
 ```
 </CodeBlock>
+
+Tres piezas nuevas en este servicio, y las tres relacionadas entre sí:
+
+- **`@Injectable({ providedIn: 'root' })`** marca la clase como disponible para el sistema de inyección de dependencias de Angular — la misma idea de DI que viste en el backend en el paso 4, ahora del lado del cliente. `providedIn: 'root'` significa que existe una única instancia compartida por toda la aplicación (un *singleton*), no una nueva cada vez que algo la pide.
+- **`inject(HttpClient)`** es cómo `TaskApiService` obtiene esa dependencia: en vez de crear su propio cliente HTTP con `new`, le pide a Angular que le entregue la instancia ya configurada — la que vas a registrar con `provideHttpClient()` a continuación.
+- **`Observable<Task[]>`** es el tipo que devuelve cada método de `HttpClient`. Se parece a una `Promise` de JavaScript (representa un valor que llegará más adelante), pero con una diferencia clave: **no hace nada hasta que alguien se suscribe** con `.subscribe(...)`, algo que verás en el paso 8. Puede además emitir varios valores a lo largo del tiempo, en vez de uno solo. Profundizamos en RxJS —la librería detrás de `Observable`— en la parte 2.
 
 Registra `HttpClient` en `src/app/app.config.ts`:
 
@@ -618,6 +643,8 @@ export class AppComponent implements OnInit {
 }
 ```
 </CodeBlock>
+
+Una pieza más que aparece por primera vez: `signal<Task[]>([])` crea un **signal**, un contenedor de estado que Angular sabe leer y "escuchar". Cuando lo actualizas con `.set(...)` o `.update(...)`, Angular sabe exactamente qué parte de la plantilla depende de ese valor y solo repinta eso, sin que tengas que decírselo tú. Por ahora, quédate con dos reglas prácticas: para leer su valor lo **llamas como función** (`tasks()`, nunca `tasks`), y nunca lo mutas directamente (nada de `tasks().push(...)`). Vas a profundizar en signals, junto con `computed` y `effect`, en la parte 1.
 
 La plantilla queda pequeña porque el componente mantiene la lógica en métodos con nombres claros:
 
