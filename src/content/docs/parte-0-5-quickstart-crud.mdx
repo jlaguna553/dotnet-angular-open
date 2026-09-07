@@ -30,6 +30,10 @@ ASP.NET Core 8 Minimal API
 SQLite (tasks.db)
 ```
 
+Cada capa de ese diagrama es una tecnología con un rol concreto. **ASP.NET Core** es el framework de Microsoft para construir servidores web en C# — es lo que recibe la petición HTTP y decide qué código ejecutar. **SQLite** es el motor de base de datos: un programa que guarda tus datos en un archivo y sabe responder consultas sobre ellos.
+
+Entre ambos falta una pieza: tu código C# trabaja con **objetos** (una clase `TaskItem` con propiedades), pero SQLite solo entiende **SQL** (`SELECT * FROM Tasks WHERE ...`). Traducir entre esos dos mundos a mano —escribir el SQL, ejecutarlo, convertir cada fila del resultado de vuelta a un objeto `TaskItem`— es exactamente el trabajo repetitivo que quieres evitar. Ahí entra **EF Core** (*Entity Framework Core*, así, con esas iniciales): un **ORM** (*Object-Relational Mapper*, "mapeador objeto-relacional") de Microsoft que hace esa traducción por ti. Le describes tus datos como clases de C# normales, y EF Core se encarga de generar el SQL, ejecutarlo contra SQLite (o Postgres, o SQL Server — con solo cambiar el "proveedor", como verás en el paso 1), y devolverte objetos ya listos para usar. En el paso 3 vas a escribir tu primer `DbContext`, que es la pieza concreta de EF Core con la que vas a interactuar.
+
 El recurso principal es `TaskItem`:
 
 | Método | Ruta | Acción |
