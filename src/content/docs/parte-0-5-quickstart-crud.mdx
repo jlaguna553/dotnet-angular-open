@@ -288,6 +288,15 @@ public sealed class TaskItem
 ```
 </CodeBlock>
 
+Línea por línea:
+
+- **`namespace Taskboard.Api.Models;`** — agrupa este archivo bajo el espacio de nombres `Taskboard.Api.Models`. En C#, el namespace normalmente refleja la carpeta (`Models/`) y es lo que te permite tener dos clases con el mismo nombre en carpetas distintas sin que choquen; también es lo que vas a escribir en un `using` cuando quieras usar esta clase desde otro archivo.
+- **`public sealed class TaskItem`** — `public` significa que cualquier otro archivo del proyecto (o de otro proyecto que lo referencie) puede usar esta clase. `sealed` significa que nadie puede crear una clase que herede de `TaskItem` — una decisión deliberada: este modelo no está diseñado para extenderse por herencia, solo para instanciarse directamente.
+- **`public int Id { get; set; }`** — una **propiedad automática**: `{ get; set; }` le dice al compilador que genere por ti un método para leer (`get`) y otro para escribir (`set`) el valor, sin que tengas que declarar un campo privado a mano. `int` es un número entero; EF Core, más adelante, va a configurar esta propiedad como clave primaria autoincremental por convención (porque se llama `Id`).
+- **`public required string Title { get; set; }`** — `required` (C# 11) obliga a que, en cualquier lugar donde crees un `TaskItem`, tengas que asignarle un `Title` explícitamente — si lo olvidas, el compilador rechaza tu código antes de que llegue a ejecutarse. Es la forma que tiene C# de decir "este dato no es opcional" sin depender de una validación en tiempo de ejecución.
+- **`public bool IsCompleted { get; set; }`** — un valor de verdadero/falso. Al no tener `required`, C# le asigna automáticamente su valor por defecto (`false`) si no lo especificas — que es exactamente el comportamiento que quieres: una tarea nueva empieza sin completar.
+- **`public DateTime CreatedAt { get; set; }`** — una fecha y hora. Fíjate que **ningún endpoint va a dejar que el cliente escriba este valor** — lo vas a ver en el paso 4, donde el servidor lo asigna con `DateTime.UtcNow` en el momento de crear la tarea, precisamente para que el navegador no pueda falsificarlo.
+
 Para evitar aceptar campos que no deberían llegar desde el navegador, define contratos explícitos en `Contracts/TaskContracts.cs`:
 
 <CodeBlock lang="csharp" title="Contracts/TaskContracts.cs">
@@ -304,7 +313,13 @@ public sealed record TaskResponse(
 ```
 </CodeBlock>
 
-`record` es un tipo de C# pensado para datos inmutables: escribir `public sealed record CreateTaskRequest(string Title);` genera automáticamente el constructor, la comparación por valor (dos records son "iguales" si sus datos coinciden, no solo si son el mismo objeto en memoria) y una representación en texto legible — todo lo que tendrías que escribir a mano con una `class` tradicional. Es la elección natural para contratos que solo transportan datos entre capas, sin comportamiento propio.
+`record` es un tipo de C# pensado para datos inmutables: escribir `public sealed record CreateTaskRequest(string Title);` genera automáticamente el constructor, la comparación por valor (dos records son "iguales" si sus datos coinciden, no solo si son el mismo objeto en memoria) y una representación en texto legible — todo lo que tendrías que escribir a mano con una `class` tradicional. Es la elección natural para contratos que solo transportan datos entre capas, sin comportamiento propio. La sintaxis `record NombreDelTipo(Tipo Propiedad, ...)` entre paréntesis es una forma abreviada de escribir el record entero en una sola línea, con una propiedad de solo lectura por cada parámetro.
+
+Fíjate que ningún record repite exactamente los campos de `TaskItem`, y eso es intencional, no un descuido:
+
+- **`CreateTaskRequest(string Title)`** — solo `Title`. Es lo único que el cliente debería poder decidir al crear una tarea; `Id` lo asigna la base de datos, `CreatedAt` lo asigna el servidor, e `IsCompleted` siempre empieza en `false`. Si este record tuviera un campo `Id`, un cliente malicioso podría intentar crear una tarea con un id ya existente.
+- **`UpdateTaskRequest(bool IsCompleted)`** — solo el campo que el endpoint de actualización (`PATCH`, en el paso 4) tiene sentido que cambie. No permite modificar el título ni la fecha de creación desde esta operación.
+- **`TaskResponse(int Id, string Title, bool IsCompleted, DateTime CreatedAt)`** — el único de los tres que sí expone los cuatro campos, porque es lo que el servidor le **devuelve** al cliente después de leer o crear una tarea; el cliente necesita el `Id` para poder referirse a esa tarea en peticiones futuras (`PATCH /api/tasks/{id}`).
 
 La respuesta pública no tiene por qué coincidir con la entidad de EF Core. Esa pequeña separación evita acoplar tu API a futuras decisiones de persistencia.
 
@@ -340,7 +355,15 @@ public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options)
 ```
 </CodeBlock>
 
-`public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options) : DbContext(options)` usa **constructores primarios** (C# 12): los parámetros entre paréntesis junto al nombre de la clase reemplazan escribir un constructor y un campo privado por separado. Y nunca vas a escribir `new TaskDbContext(...)` en ningún lado — quién construye esta clase, y cuándo, es exactamente lo que verás en el siguiente paso.
+Línea por línea:
+
+- **`using Microsoft.EntityFrameworkCore;`** y **`using Taskboard.Api.Models;`** — importan, respectivamente, los tipos de EF Core (`DbContext`, `DbSet`, `ModelBuilder`...) y tu propio `TaskItem`. Sin el primero, el compilador no reconocería `DbContext` ni `ModelBuilder`.
+- **`public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options) : DbContext(options)`** — usa **constructores primarios** (C# 12): los parámetros entre paréntesis junto al nombre de la clase reemplazan escribir un constructor y un campo privado por separado. `: DbContext(options)` hereda de la clase base de EF Core y le reenvía esas opciones (que incluyen, entre otras cosas, qué base de datos usar — lo verás configurado en el paso 4). Nunca vas a escribir `new TaskDbContext(...)` en ningún lado: quién construye esta clase, y cuándo, es exactamente lo que verás en el siguiente paso (inyección de dependencias).
+- **`public DbSet<TaskItem> Tasks => Set<TaskItem>();`** — un `DbSet<TaskItem>` representa, conceptualmente, "la tabla de tareas": es el objeto sobre el que vas a escribir consultas (`database.Tasks.Where(...)`) y cambios (`database.Tasks.Add(...)`). La flecha `=>` es una **propiedad con cuerpo de expresión**: en vez de un `{ get { return ...; } }` completo, es una forma corta de decir "cada vez que alguien lea `Tasks`, devuelve el resultado de `Set<TaskItem>()`" (un método heredado de `DbContext` que localiza o crea ese `DbSet` internamente).
+- **`protected override void OnModelCreating(ModelBuilder modelBuilder)`** — un método que **EF Core llama automáticamente**, una sola vez, cuando construye el modelo por primera vez — tú nunca lo invocas directamente. `protected` porque solo la propia clase (y quien herede de ella) necesita implementarlo; `override` porque estás reemplazando la versión vacía que trae `DbContext` por defecto.
+- **`modelBuilder.Entity<TaskItem>(entity => { ... })`** — le dice a EF Core "voy a configurar reglas específicas para la tabla que representa a `TaskItem`". Todo lo que va dentro de las llaves usa la variable `entity` para referirse a esa configuración — este estilo, donde encadenas métodos que van devolviendo el mismo objeto para seguir configurando, se llama **fluent API**.
+- **`entity.Property(task => task.Title).HasMaxLength(160).IsRequired();`** — `task => task.Title` es una expresión lambda que apunta a la propiedad `Title` (en vez de pasar el nombre como texto plano `"Title"`, lo que te daría un error de compilación si algún día renombras la propiedad, no un fallo silencioso en producción). `.HasMaxLength(160)` limita la columna a 160 caracteres en la base de datos; `.IsRequired()` la marca como `NOT NULL`.
+- **`entity.Property(task => task.CreatedAt).HasDefaultValueSql("CURRENT_TIMESTAMP");`** — le dice a SQLite que, si nadie especifica un valor para esta columna al insertar una fila, use la fecha y hora actuales por defecto. Es una capa extra de seguridad además de que el propio C# ya asigna `DateTime.UtcNow` en el paso 4 — si algún día insertas datos directamente en SQL sin pasar por tu API, la columna sigue teniendo un valor razonable.
 
 En `appsettings.json`, configura la conexión con un archivo local. En producción sustituirás esta cadena por una variable de entorno.
 
@@ -359,6 +382,9 @@ En `appsettings.json`, configura la conexión con un archivo local. En producci�
 }
 ```
 </CodeBlock>
+
+- **`"ConnectionStrings": { "Taskboard": "Data Source=taskboard.db" }`** — una cadena de conexión le dice a EF Core dónde y cómo conectarse a la base de datos; su formato depende del proveedor (para SQLite, `Data Source=<archivo>` basta). `"Taskboard"` es solo el nombre que le diste a esta entrada — es el mismo string que vas a usar para leerla en el paso 4 con `GetConnectionString("Taskboard")`. Al ejecutar la API, SQLite crea el archivo `taskboard.db` en la carpeta desde la que corres `dotnet run`, si todavía no existe.
+- **`"Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } }`** — controla qué tan detallados son los mensajes que la aplicación escribe en la consola. `"Default": "Information"` es el nivel general (verás mensajes informativos de tu propio código); `"Microsoft.AspNetCore": "Warning"` sube el umbral solo para los mensajes que genera el propio framework, para no inundar la consola con detalles internos de ASP.NET Core que rara vez necesitas mientras desarrollas.
 
 ## 4. Construye la API Minimal
 
@@ -471,16 +497,57 @@ public partial class Program { }
 ```
 </CodeBlock>
 
-Antes de los detalles puntuales, dos conceptos que se repiten en **cada** endpoint y que vale la pena nombrar:
+### La configuración inicial, línea por línea
 
-- **Inyección de dependencias (DI).** Fíjate que en `(TaskDbContext database, CancellationToken cancellationToken) => { ... }` nunca escribes `new TaskDbContext(...)` — `database` simplemente aparece como parámetro, ya listo para usar. Esto es DI: le dijiste al framework, con `builder.Services.AddDbContext<TaskDbContext>(...)`, *cómo* construir un `TaskDbContext` cuando alguien lo necesite. ASP.NET Core inspecciona los parámetros de cada handler, reconoce que pide un `TaskDbContext`, y te entrega una instancia ya configurada — una nueva por cada petición HTTP. No lo pasas a mano por ningún lado; el framework lo resuelve por ti a partir del tipo declarado. Vas a ver la misma idea, con otro nombre (`inject()`), del lado de Angular en el paso 7.
+- **`var builder = WebApplication.CreateBuilder(args);`** — el punto de partida de cualquier app ASP.NET Core moderna: crea un "constructor" que sabe leer `appsettings.json`, las variables de entorno y los argumentos de línea de comandos (`args`), y que vas a usar para registrar servicios antes de arrancar la aplicación de verdad.
+- **`builder.Services.AddDbContext<TaskDbContext>(options => options.UseSqlite(builder.Configuration.GetConnectionString("Taskboard")));`** — `builder.Services` es el contenedor de inyección de dependencias del que ya hablamos en el paso 3: aquí le estás enseñando **cómo** construir un `TaskDbContext` cuando algún endpoint lo pida. `options => options.UseSqlite(...)` es una función que configura ese `TaskDbContext` para usar el proveedor de SQLite (el paquete que instalaste en el paso 1), leyendo la cadena de conexión `"Taskboard"` que definiste en `appsettings.json` un momento atrás.
+- **`builder.Services.AddCors(options => { options.AddPolicy("AngularDev", policy => policy.WithOrigins("http://localhost:4200").AllowAnyHeader().AllowAnyMethod()); });`** — registra una **política de CORS** (*Cross-Origin Resource Sharing*) llamada `"AngularDev"`. Por defecto, los navegadores bloquean que una página servida desde un origen (`http://localhost:4200`, donde corre Angular) haga peticiones a otro origen distinto (`http://localhost:5000`, donde corre la API) — CORS es el mecanismo por el cual el servidor le dice explícitamente al navegador "confío en peticiones que vienen de este origen". `.WithOrigins(...)` especifica cuál; `.AllowAnyHeader()` y `.AllowAnyMethod()` permiten cualquier encabezado y cualquier verbo HTTP (`GET`, `POST`, etc.) desde ese origen.
+- **`var app = builder.Build();`** — a partir de aquí, ya no puedes registrar más servicios (`builder.Services...`) — `Build()` "sella" la configuración y te da la aplicación ya construida, sobre la que vas a definir el pipeline de middleware y los endpoints.
+- **`app.UseCors("AngularDev");`** — activa, dentro del pipeline de la aplicación, la política de CORS que registraste arriba. Sin esta línea, `AddCors` habría quedado configurado pero nunca aplicado a ninguna petición real.
+- **El bloque `using (var scope = app.Services.CreateScope()) { ... }`** — ejecuta la migración de la base de datos (`await database.Database.MigrateAsync();`) una sola vez, al arrancar la aplicación, aplicando cualquier migración pendiente (la que vas a crear en el paso 5) sin que tengas que correr `dotnet ef database update` manualmente cada vez que despliegues. Necesita un `scope` explícito (en vez de pedir el `TaskDbContext` directamente) porque, a diferencia de dentro de un endpoint, aquí todavía no hay una petición HTTP en curso que le proporcione uno automáticamente — `CreateScope()` crea uno "de mentira", solo para este arranque, y `GetRequiredService<TaskDbContext>()` es cómo le pides al contenedor de DI que te entregue una instancia dentro de ese scope.
+
+### Los cuatro endpoints
+
+Antes de los detalles puntuales, dos conceptos que se repiten en **cada** uno y que vale la pena nombrar:
+
+- **Inyección de dependencias (DI).** Fíjate que en `(TaskDbContext database, CancellationToken cancellationToken) => { ... }` nunca escribes `new TaskDbContext(...)` — `database` simplemente aparece como parámetro, ya listo para usar. Esto es DI: le dijiste al framework, con `AddDbContext<TaskDbContext>(...)` arriba, *cómo* construir un `TaskDbContext` cuando alguien lo necesite. ASP.NET Core inspecciona los parámetros de cada handler, reconoce que pide un `TaskDbContext`, y te entrega una instancia ya configurada — una nueva por cada petición HTTP. Vas a ver la misma idea, con otro nombre (`inject()`), del lado de Angular en el paso 7.
 - **`async`/`await` y `CancellationToken`.** Marcar un método como `async` y usar `await` dentro le permite al servidor seguir atendiendo otras peticiones mientras espera algo lento —aquí, una consulta a la base de datos— en lugar de bloquear un hilo sin hacer nada mientras tanto. `CancellationToken` es una señal que ASP.NET Core te pasa automáticamente y que se activa si el cliente cierra la conexión antes de que termines de responder, para que puedas abandonar el trabajo a medio hacer en vez de completarlo igual sin que nadie vaya a leer el resultado.
 
-Y tres detalles más puntuales que vale la pena observar:
+**`app.MapGet("/api/tasks", async (TaskDbContext database, CancellationToken cancellationToken) => { ... });`** — `"/api/tasks"` es la ruta; todo lo que sigue es el *handler*, la función que se ejecuta cuando llega esa petición.
 
-1. `AsNoTracking()` hace explícito que el listado es de solo lectura.
-2. `Results.Created` devuelve el recurso creado y su URL en el encabezado `Location`.
-3. `public partial class Program` permite que los tests de integración encuentren el entry point.
+- `database.Tasks` — el `DbSet<TaskItem>` del paso 3: el punto de partida de la consulta.
+- `.AsNoTracking()` — le dice a EF Core que no necesita llevar un registro interno de estos objetos para detectar cambios más adelante — algo que EF Core hace por defecto pensando en que quizás quieras modificarlos y guardarlos después. Como este endpoint solo lee datos para mostrarlos, desactivarlo hace la consulta más liviana.
+- `.OrderByDescending(task => task.CreatedAt)` — ordena el resultado de más reciente a más antiguo, usando la misma sintaxis de lambda que ya viste en `OnModelCreating`.
+- `.Select(task => new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt))` — transforma cada `TaskItem` (la entidad de EF Core) en un `TaskResponse` (el contrato del paso 2) — este es, en código, el momento exacto donde ocurre la separación entre "lo que guardas" y "lo que expones" de la que hablamos en el paso 2.
+- `.ToListAsync(cancellationToken)` — ejecuta la consulta contra la base de datos y espera el resultado como una lista; es aquí, no antes, donde realmente se dispara el SQL (todo lo anterior solo iba construyendo la consulta).
+- `Results.Ok(tasks)` — construye una respuesta HTTP `200 OK` con `tasks` serializado como JSON en el cuerpo.
+
+**`app.MapPost("/api/tasks", async (CreateTaskRequest request, TaskDbContext database, CancellationToken cancellationToken) => { ... });`** — ASP.NET Core reconoce que `CreateTaskRequest` no es un tipo conocido del framework (como `TaskDbContext` o `CancellationToken`) y, por convención, asume que debe **deserializarlo del cuerpo JSON de la petición**.
+
+- `request.Title.Trim()` — quita espacios en blanco al principio y al final antes de validar o guardar; así `"  Comprar leche  "` y `"Comprar leche"` se tratan como el mismo título.
+- `if (title.Length is < 1 or > 160)` — el patrón `is < 1 or > 160` (C# 9) es una forma compacta de escribir `title.Length < 1 || title.Length > 160`. Si el título queda vacío después del `Trim()`, o supera el límite que configuraste en `HasMaxLength(160)`, se rechaza.
+- `Results.ValidationProblem(new Dictionary<string, string[]> { [nameof(request.Title)] = ["Escribe entre 1 y 160 caracteres."] })` — construye una respuesta `400 Bad Request` con el formato estándar de errores de validación de ASP.NET Core. `nameof(request.Title)` produce el texto `"Title"` sin escribirlo a mano — si algún día renombras la propiedad, este texto se actualiza solo. El valor es un arreglo de strings porque un mismo campo podría tener varios mensajes de error a la vez.
+- `var task = new TaskItem { Title = title, CreatedAt = DateTime.UtcNow };` — aquí es donde el servidor, y no el cliente, decide el valor de `CreatedAt` — la razón por la que `CreateTaskRequest` nunca incluyó ese campo.
+- `database.Tasks.Add(task);` seguido de `await database.SaveChangesAsync(cancellationToken);` — son dos pasos separados a propósito: `Add` solo marca el objeto como "pendiente de insertar" en memoria; `SaveChangesAsync` es el que realmente ejecuta el `INSERT` contra SQLite. Entre ambas líneas podrías, en teoría, añadir más cambios (otra tarea, una actualización) y se guardarían todos juntos en una sola operación.
+- `Results.Created($"/api/tasks/{task.Id}", new TaskResponse(...))` — construye un `201 Created`. El primer argumento es la URL del recurso recién creado (va en el encabezado HTTP `Location`); fíjate que `task.Id` ya tiene un valor aquí, aunque tú nunca lo asignaste — SQLite se lo asignó automáticamente al ejecutar el `INSERT`, y EF Core actualizó el objeto `task` en memoria con ese valor.
+
+**`app.MapPatch("/api/tasks/{id:int}", async (int id, UpdateTaskRequest request, TaskDbContext database, CancellationToken cancellationToken) => { ... });`** — `{id:int}` es un **parámetro de ruta con restricción de tipo**: captura el segmento de la URL que ocupa `{id}` (por ejemplo, el `7` en `/api/tasks/7`) y le exige a ASP.NET Core que sea un número entero — si alguien pide `/api/tasks/abc`, la ruta ni siquiera coincide, y responde `404` antes de que tu código se ejecute.
+
+- `await database.Tasks.FindAsync([id], cancellationToken);` — busca una fila por su clave primaria. `FindAsync` recibe un arreglo (`[id]`) porque, en general, una clave primaria puede estar compuesta de varias columnas; aquí solo tiene una.
+- `if (task is null) return Results.NotFound();` — si no existe ninguna tarea con ese id, corta la ejecución con un `404`, en vez de seguir adelante con un objeto que no existe.
+- `task.IsCompleted = request.IsCompleted;` — a diferencia de `Create`, aquí sí modificas directamente el objeto que EF Core te devolvió (porque este `FindAsync`, a diferencia del `AsNoTracking()` de `GetAll`, sí lo está rastreando) — es lo que le permite a `SaveChangesAsync` detectar qué cambió y generar el `UPDATE` correspondiente.
+- `Results.NoContent()` — un `204`: la operación tuvo éxito, pero no hay nada que devolver en el cuerpo (el cliente ya sabe qué cambió, porque fue quien lo pidió).
+
+**`app.MapDelete("/api/tasks/{id:int}", async (int id, TaskDbContext database, CancellationToken cancellationToken) => { ... });`**
+
+- `database.Tasks.Where(task => task.Id == id).ExecuteDeleteAsync(cancellationToken)` — a diferencia de `UpdateStatus`, este endpoint no busca primero el objeto y luego lo borra: `ExecuteDeleteAsync` traduce la condición del `Where` directamente a un `DELETE ... WHERE Id = @id` en SQL, sin traer la fila a memoria primero — más eficiente cuando no necesitas el objeto para nada más que borrarlo. Devuelve cuántas filas se borraron.
+- `return deleted == 0 ? Results.NotFound() : Results.NoContent();` — un operador ternario: si no se borró ninguna fila (el id no existía), `404`; si se borró una, `204`.
+
+Y tres detalles más, sobre el archivo en su conjunto:
+
+1. `Results.Created` devuelve el recurso creado y su URL en el encabezado `Location`, como ya viste en `MapPost`.
+2. Cada handler recibe exactamente los parámetros que necesita (`TaskDbContext`, `CancellationToken`, el `id` de ruta, el cuerpo deserializado) — ASP.NET Core los resuelve a todos de la misma forma, combinando DI con los datos de la petición HTTP.
+3. `public partial class Program { }`, al final del archivo, permite que los tests de integración (parte 11) encuentren el *entry point* de tu aplicación para levantarla en memoria durante un test — sin esta línea, la clase `Program` que genera `dotnet new web` internamente no sería accesible desde fuera del proyecto.
 
 ## 5. Crea la migración
 
@@ -565,6 +632,8 @@ export interface CreateTaskRequest {
 
 Una `interface` de TypeScript no genera ningún código — desaparece por completo al compilar a JavaScript. Solo le describe a tu editor y al compilador qué forma debe tener un objeto, para que te avisen antes de ejecutar nada si accedes a una propiedad que no existe o le pasas un tipo equivocado a una función.
 
+Fíjate que `Task` y `CreateTaskRequest` reflejan, del lado de Angular, la misma separación que ya viste en `TaskResponse` y `CreateTaskRequest` de C# en el paso 2: `Task` tiene los cuatro campos porque así es como la API te devuelve una tarea, mientras que `CreateTaskRequest` solo tiene `title` porque es lo único que el formulario necesita enviar — `id`, `isCompleted` y `createdAt` los decide el servidor, no el cliente.
+
 Crea un proxy para que el navegador llame a `/api` sin problemas de CORS durante el desarrollo:
 
 <CodeBlock lang="json" title="proxy.conf.json">
@@ -579,6 +648,11 @@ Crea un proxy para que el navegador llame a `/api` sin problemas de CORS durante
 ```
 </CodeBlock>
 
+- **La clave `"/api"`** — cualquier petición que Angular haga a una URL que empiece con `/api` (por ejemplo, `/api/tasks`, tal como lo escribiste en `TaskApiService` un momento más abajo) activa esta regla del proxy.
+- **`"target": "https://localhost:7123"`** — a dónde reenviar esa petición de verdad: el puerto real donde corre tu API .NET (el que anotaste al final del paso 5).
+- **`"secure": false`** — le dice al proxy que no valide el certificado HTTPS del target. El certificado que usa `dotnet run` en desarrollo es autofirmado (no está avalado por una autoridad reconocida), así que sin esta opción el proxy rechazaría la conexión.
+- **`"changeOrigin": true`** — reescribe el encabezado `Host` de la petición para que coincida con el `target`, en vez de conservar `localhost:4200`. Algunos servidores (no es el caso de Kestrel por defecto, pero es una buena práctica general) rechazan peticiones cuyo `Host` no coincide con el dominio al que realmente están escuchando.
+
 Actualiza el script `start` en `package.json` de Angular:
 
 <CodeBlock lang="json" title="taskboard-web/package.json">
@@ -590,6 +664,8 @@ Actualiza el script `start` en `package.json` de Angular:
 }
 ```
 </CodeBlock>
+
+`ng serve` por sí solo no sabe nada de tu API — es `--proxy-config proxy.conf.json` lo que le indica que use el archivo que acabas de crear. Este script es lo que se ejecuta cuando escribes `npm start` (lo verás en el paso 9): npm simplemente busca la clave `"start"` dentro de `"scripts"` y corre el comando asociado.
 
 ## 7. Encapsula el acceso HTTP
 
@@ -632,6 +708,13 @@ Tres piezas nuevas en este servicio, y las tres relacionadas entre sí:
 - **`inject(HttpClient)`** es cómo `TaskApiService` obtiene esa dependencia: en vez de crear su propio cliente HTTP con `new`, le pide a Angular que le entregue la instancia ya configurada — la que vas a registrar con `provideHttpClient()` a continuación.
 - **`Observable<Task[]>`** es el tipo que devuelve cada método de `HttpClient`. Se parece a una `Promise` de JavaScript (representa un valor que llegará más adelante), pero con una diferencia clave: **no hace nada hasta que alguien se suscribe** con `.subscribe(...)`, algo que verás en el paso 8. Puede además emitir varios valores a lo largo del tiempo, en vez de uno solo. Profundizamos en RxJS —la librería detrás de `Observable`— en la parte 2.
 
+Y los cuatro métodos, uno por operación:
+
+- **`getAll()`** — `this.http.get<Task[]>(this.resourceUrl)` hace una petición `GET` a `/api/tasks` y le dice a TypeScript, con `<Task[]>`, qué forma esperar en la respuesta — no es una conversión real (TypeScript no valida en tiempo de ejecución que el JSON tenga esa forma), es una promesa que le haces al compilador para que te avise si usas el resultado incorrectamente.
+- **`create(request)`** — `this.http.post<Task>(this.resourceUrl, request)`: el segundo argumento de `post` es el cuerpo de la petición — Angular lo serializa a JSON automáticamente. Coincide exactamente con el `CreateTaskRequest` que espera `MapPost` del lado de .NET.
+- **`updateStatus(id, isCompleted)`** — ``this.http.patch<void>(`${this.resourceUrl}/${id}`, { isCompleted })`` arma la URL con un *template literal* (el texto entre backticks con `${...}` dentro, que interpola una expresión) en vez de concatenar strings con `+`. `<void>` porque el `MapPatch` del backend responde `204 No Content` — no hay ningún cuerpo que esperar de vuelta. `{ isCompleted }` es la forma corta de escribir `{ isCompleted: isCompleted }` cuando el nombre de la propiedad coincide con el de la variable.
+- **`remove(id)`** — `this.http.delete<void>(...)`, mismo patrón que `updateStatus` pero sin cuerpo, porque `MapDelete` no necesita ningún dato adicional aparte del `id` que ya va en la URL.
+
 Registra `HttpClient` en `src/app/app.config.ts`:
 
 <CodeBlock lang="typescript" title="src/app/app.config.ts">
@@ -649,6 +732,9 @@ export const appConfig: ApplicationConfig = {
 };
 ```
 </CodeBlock>
+
+- **`ApplicationConfig`** — el tipo de un objeto de configuración a nivel de toda la aplicación (a diferencia de `NgModule`, que ya no usas en un proyecto standalone). `ng new --standalone` ya generó este archivo con `provideRouter(routes)` dentro; `provideHttpClient()` es lo único que añades tú.
+- **`providers: [...]`** — un arreglo de "proveedores": cada `provide*()` registra algo en el sistema de inyección de dependencias de Angular, disponible para toda la aplicación. `provideRouter(routes)` habilita el enrutador con las rutas de `app.routes.ts` (que `--routing` generó vacías); `provideHttpClient()` es lo que hace posible que `inject(HttpClient)`, dentro de `TaskApiService`, encuentre una instancia real en lugar de fallar.
 
 ## 8. Construye el componente
 
@@ -727,6 +813,21 @@ export class AppComponent implements OnInit {
 
 Una pieza más que aparece por primera vez: `signal<Task[]>([])` crea un **signal**, un contenedor de estado que Angular sabe leer y "escuchar". Cuando lo actualizas con `.set(...)` o `.update(...)`, Angular sabe exactamente qué parte de la plantilla depende de ese valor y solo repinta eso, sin que tengas que decírselo tú. Por ahora, quédate con dos reglas prácticas: para leer su valor lo **llamas como función** (`tasks()`, nunca `tasks`), y nunca lo mutas directamente (nada de `tasks().push(...)`). Vas a profundizar en signals, junto con `computed` y `effect`, en la parte 1.
 
+Repasemos el resto del archivo, de arriba a abajo:
+
+- **El decorador `@Component({...})`** — le da a Angular los metadatos que necesita para tratar esta clase como un componente: `selector: 'app-root'` es el nombre de etiqueta HTML que representa a este componente (`<app-root>`, la que usa `index.html` para arrancar la aplicación); `standalone: true` es explícito aunque ya sea el valor por defecto; `imports: [FormsModule]` trae `[(ngModel)]`, que vas a usar en la plantilla; `templateUrl` y `styleUrl` apuntan a los archivos HTML y SCSS asociados, en vez de escribir el template inline.
+- **`export class AppComponent implements OnInit`** — `implements OnInit` es un compromiso con el compilador: "esta clase va a tener un método `ngOnInit()`". Angular llama a `ngOnInit()` automáticamente una sola vez, justo después de crear el componente — es el lugar convencional para disparar la carga inicial de datos, en vez de hacerlo en el constructor.
+- **`private readonly taskApi = inject(TaskApiService);`** — mismo patrón de inyección de dependencias que ya viste dentro de `TaskApiService` en el paso 7, ahora consumiendo ese propio servicio. `private` porque solo esta clase lo necesita; `readonly` porque, una vez asignado, nunca se reemplaza por otra instancia.
+- **`newTitle = '';`** — una propiedad de clase normal, no un signal. Es una elección deliberada: este valor solo lo necesita el `[(ngModel)]` del formulario (paso siguiente) para funcionar, y Angular ya sabe re-renderizar el `<input>` que lo usa sin necesitar la maquinaria de un signal — no todo el estado de un componente necesita ser un signal.
+- **`ngOnInit(): void { this.loadTasks(); }`** — delega en un método aparte en vez de poner la lógica directamente aquí, para que `loadTasks()` también se pueda llamar de nuevo más adelante (por ejemplo, desde un futuro botón "recargar") sin duplicar código.
+- **`loadTasks()`** — `this.isLoading.set(true)` antes de pedir los datos, y `.set(false)` tanto si la petición tiene éxito como si falla (dentro de `next` y de `error` respectivamente) — así la UI siempre sale del estado "cargando", nunca se queda pegada en él. `.subscribe({ next: ..., error: ... })` es cómo consumes un `Observable`: `next` se ejecuta con el valor emitido si todo sale bien, `error` si la petición falla (por ejemplo, si la API no está corriendo).
+- **`addTask()`** — valida en el cliente (`if (!title) return;`) antes de siquiera intentar la petición, para no gastar una llamada HTTP en un título vacío — aunque la API también valide del lado del servidor (paso 4), esa doble validación no es redundante: una existe para dar feedback inmediato al usuario, la otra para no confiar nunca en lo que envía el cliente.
+- **`this.tasks.update((tasks) => [task, ...tasks])`** — `.update()` recibe el valor actual del signal y devuelve el nuevo; `[task, ...tasks]` crea un **arreglo nuevo** con `task` al principio seguido de todos los elementos anteriores (el operador `...` "esparce" los elementos de `tasks` dentro del arreglo nuevo). Nunca modificas el arreglo original con algo como `.push()` — los signals de Angular detectan cambios comparando referencias, así que necesitas un objeto nuevo, no el mismo mutado.
+- **`toggleTask()`** — el mismo patrón de "no mutar", ahora con `.map()`: recorre todas las tareas y devuelve un arreglo nuevo donde, si el `id` coincide, reemplaza esa tarea por una copia (`{ ...item, isCompleted: !item.isCompleted }`) con el campo cambiado; el resto de tareas se devuelven tal cual.
+- **`removeTask()`** — `.filter((item) => item.id !== task.id)` devuelve un arreglo nuevo con todas las tareas **excepto** la que coincide — la forma idiomática de "eliminar un elemento" sin mutar el arreglo original.
+
+En los tres métodos de escritura, fíjate en el orden: primero llamas al servicio HTTP, y **solo si tiene éxito** (dentro de `next`) actualizas el signal local — nunca actualizas la UI de forma optimista antes de confirmar que el servidor aceptó el cambio.
+
 La plantilla queda pequeña porque el componente mantiene la lógica en métodos con nombres claros:
 
 <CodeBlock lang="html" title="src/app/app.component.html">
@@ -771,6 +872,17 @@ La plantilla queda pequeña porque el componente mantiene la lógica en métodos
 </main>
 ```
 </CodeBlock>
+
+Sintaxis nueva, de arriba a abajo:
+
+- **`{{ ... }}`** (interpolación) — inserta el resultado de una expresión de TypeScript como texto. `{{ errorMessage() }}` funciona porque, como viste antes, un signal se lee llamándolo como función.
+- **`(ngSubmit)="addTask()"`** — un *event binding*: ejecuta `addTask()` cuando el formulario se envía (al presionar Enter o hacer clic en el botón `submit`), en vez de recargar la página como haría un `<form>` HTML normal.
+- **`[(ngModel)]="newTitle"`** — *two-way binding*: mantiene sincronizados el valor del `<input>` y la propiedad `newTitle` del componente en ambas direcciones, gracias al `FormsModule` que importaste en el paso anterior.
+- **`@if (errorMessage()) { ... }`** — el control flow moderno de Angular (parte 1): el bloque solo se renderiza si la expresión entre paréntesis es verdadera. Como `errorMessage()` empieza como `''` (string vacío, que JavaScript trata como falso), este mensaje no aparece hasta que ocurra un error real.
+- **`@if (isLoading()) { ... } @else { ... }`** — dos estados mutuamente excluyentes: mientras `isLoading()` sea verdadero, se muestra "Cargando tareas..."; en cuanto pase a `false`, Angular renderiza el bloque `@else` en su lugar.
+- **`@for (task of tasks(); track task.id) { ... } @empty { ... }`** — itera sobre el arreglo que devuelve `tasks()`. `track task.id` (obligatorio en la nueva sintaxis) le dice a Angular cómo identificar cada elemento entre un render y el siguiente, para actualizar solo lo que cambió en vez de destruir y recrear toda la lista. El bloque `@empty` se muestra en su lugar si el arreglo está vacío — reemplaza tener que escribir esa condición a mano con un `@if` separado.
+- **`[class.completed]="task.isCompleted"`** — un *property binding* especial para clases CSS: añade la clase `completed` al elemento solo si `task.isCompleted` es verdadero, y la quita automáticamente si vuelve a ser falso.
+- **`(click)="toggleTask(task)"`** — otro *event binding*, esta vez para un clic. Fíjate que le pasas `task` (la tarea de esta iteración específica del `@for`) como argumento, para que el método sepa exactamente cuál de todas las tareas cambiar.
 
 Los estilos pueden ser tan simples como el resto de la app. Lo importante es que los estados estén representados: carga, error, lista vacía y tarea completada.
 
