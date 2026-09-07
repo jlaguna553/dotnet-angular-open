@@ -173,6 +173,22 @@ dotnet sln add Taskboard.Api/Taskboard.Api.csproj
 - `dotnet new web -n Taskboard.Api` genera el proyecto ASP.NET Core más pequeño que existe: solo un `Program.cs` y un `.csproj`, sin controladores ni carpetas de MVC — la plantilla `web` es, precisamente, la que usan las Minimal API que vas a construir en este capítulo. `-n` nombra tanto el proyecto como la carpeta que crea.
 - `dotnet sln add ...` **no ocurre automáticamente**: crear un proyecto y registrarlo en la solución son dos pasos separados. Sin este comando, `Taskboard.Api` existiría en el disco pero `dotnet build` a nivel de solución lo ignoraría.
 
+Así se ve `Taskboard.Api.csproj` justo después de crearlo — este es el archivo XML que describe el proyecto, y todavía no tiene ningún paquete instalado:
+
+<CodeBlock lang="xml" title="Taskboard.Api/Taskboard.Api.csproj (recién creado)">
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
+```
+</CodeBlock>
+
 Y el proyecto de Angular, como carpeta hermana de `Taskboard.Api` (no dentro de ella):
 
 <CodeBlock lang="bash" title="Terminal">
@@ -212,7 +228,30 @@ Son tres piezas distintas, y vale la pena distinguirlas:
 
 - **`Microsoft.EntityFrameworkCore.Sqlite`** es el *proveedor*: la pieza que sabe traducir las operaciones de EF Core al SQL específico de SQLite. Cada motor de base de datos necesita su propio proveedor — en la parte 4 vas a sustituir este paquete por `Npgsql.EntityFrameworkCore.PostgreSQL` sin cambiar ninguna otra línea de código.
 - **`Microsoft.EntityFrameworkCore.Design`** trae las herramientas necesarias **solo en tiempo de desarrollo** para generar migraciones (`dotnet ef migrations add`, que verás en el paso 5). No la necesita la aplicación cuando corre en producción, pero sí el propio comando `dotnet ef` para inspeccionar tu proyecto y generar el código de la migración.
-- **`dotnet tool install --global dotnet-ef`** es distinto a los dos anteriores: no es un paquete NuGet que se referencia desde el `.csproj`, sino una **herramienta de línea de comandos** que se instala una sola vez en tu máquina (`--global`) y queda disponible como `dotnet ef` en cualquier proyecto, no solo en Taskboard.
+- **`dotnet tool install --global dotnet-ef`** es distinto a los dos anteriores: no es un paquete NuGet que se referencia desde el `.csproj`, sino una **herramienta de línea de comandos** que se instala una sola vez en tu máquina (`--global`) y queda disponible como `dotnet ef` en cualquier proyecto, no solo en Taskboard. Por eso, a diferencia de los otros dos comandos, este no deja ningún rastro dentro de `Taskboard.Api.csproj`.
+
+Así se ve el mismo `Taskboard.Api.csproj` después de los dos `dotnet add package` — compáralo con la versión de más arriba:
+
+<CodeBlock lang="xml" title="Taskboard.Api/Taskboard.Api.csproj (después de instalar EF Core)">
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.10" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+
+</Project>
+```
+</CodeBlock>
+
+Apareció un `<ItemGroup>` nuevo con una línea `<PackageReference>` por cada paquete — tú no editaste este archivo a mano, `dotnet add package` lo hizo por ti. El número de versión que veas puede no ser exactamente `8.0.10`: NuGet resuelve automáticamente la versión más reciente compatible con el rango `8.*` que pediste, en el momento en que ejecutaste el comando. Para quitar una dependencia más adelante, el comando inverso es `dotnet remove package <nombre>` — borra la línea correspondiente de este mismo archivo.
 
 ### La estructura que acabas de crear
 
@@ -454,6 +493,44 @@ dotnet ef database update
 dotnet run
 ```
 </CodeBlock>
+
+`dotnet ef migrations add InitialCreate` todavía no toca ninguna base de datos — genera código C# que **describe** el cambio. Después de ejecutarlo, aparece una carpeta nueva que tú no escribiste a mano:
+
+<CodeBlock lang="text" title="Taskboard.Api/">
+```text
+Taskboard.Api/
+└── Migrations/
+    ├── 20260907120000_InitialCreate.cs           — instrucciones Up()/Down() de este cambio
+    ├── 20260907120000_InitialCreate.Designer.cs  — metadatos que usa el propio EF Core
+    └── TaskDbContextModelSnapshot.cs             — una "foto" completa del modelo actual
+```
+</CodeBlock>
+
+Y dentro de `InitialCreate.cs`, el método `Up()` —el que se ejecuta al aplicar la migración— contiene, generado automáticamente a partir de tu clase `TaskItem`, algo equivalente a esto:
+
+<CodeBlock lang="csharp" title="Migrations/..._InitialCreate.cs (generado, no lo escribes tú)">
+```csharp
+protected override void Up(MigrationBuilder migrationBuilder)
+{
+    migrationBuilder.CreateTable(
+        name: "Tasks",
+        columns: table => new
+        {
+            Id = table.Column<int>(type: "INTEGER", nullable: false)
+                .Annotation("Sqlite:Autoincrement", true),
+            Title = table.Column<string>(type: "TEXT", maxLength: 160, nullable: false),
+            IsCompleted = table.Column<bool>(type: "INTEGER", nullable: false),
+            CreatedAt = table.Column<DateTime>(type: "TEXT", nullable: false, defaultValueSql: "CURRENT_TIMESTAMP")
+        },
+        constraints: table =>
+        {
+            table.PrimaryKey("PK_Tasks", x => x.Id);
+        });
+}
+```
+</CodeBlock>
+
+Cada propiedad de `TaskItem` se convirtió en una columna, y las reglas que declaraste en `OnModelCreating` (`HasMaxLength(160)`, `HasDefaultValueSql(...)`) aparecen tal cual en las columnas correspondientes. `dotnet ef database update` es el paso que **ejecuta** ese `Up()` de verdad — es en ese momento, no antes, cuando el archivo `taskboard.db` aparece en disco con la tabla `Tasks` ya creada.
 
 Visita `http://localhost:5000/api/tasks`. La respuesta inicial será `[]`. Puedes probar una creación con curl:
 
