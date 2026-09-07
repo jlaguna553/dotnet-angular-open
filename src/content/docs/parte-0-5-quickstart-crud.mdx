@@ -138,21 +138,55 @@ No necesitas Docker ni una base de datos instalada para este capítulo: SQLite v
 
 ## 1. Crea la solución
 
-Separa backend y frontend desde el primer día. Esto hace visibles los límites y permite desplegarlos de forma independiente.
+Separa backend y frontend desde el primer día. Esto hace visibles los límites y permite desplegarlos de forma independiente — el mismo principio de "cliente-servidor" de la parte 0. Vas a crear tres cosas distintas, cada una con un propósito concreto: una *solución* de .NET (el archivo que agrupa proyectos backend), el proyecto de la API en sí, y el proyecto de Angular como carpeta hermana, no anidada dentro de la API.
+
+Primero, la carpeta raíz y la solución:
 
 <CodeBlock lang="bash" title="Terminal">
 ```bash
 mkdir taskboard && cd taskboard
 dotnet new sln -n Taskboard
+```
+</CodeBlock>
+
+`dotnet new sln` crea `Taskboard.sln`, un archivo vacío que **agrupa proyectos** de .NET para poder compilarlos, testearlos o abrirlos juntos en el editor — todavía no contiene ningún código. Hoy vas a añadirle un solo proyecto, pero en la parte 10 esta misma solución va a crecer a cuatro (`Domain`, `Application`, `Infrastructure`, `Api`); tenerla desde ahora evita reestructurar más adelante.
+
+Ahora el proyecto de la API:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
 dotnet new web -n Taskboard.Api
 dotnet sln add Taskboard.Api/Taskboard.Api.csproj
+```
+</CodeBlock>
+
+- `dotnet new web -n Taskboard.Api` genera el proyecto ASP.NET Core más pequeño que existe: solo un `Program.cs` y un `.csproj`, sin controladores ni carpetas de MVC — la plantilla `web` es, precisamente, la que usan las Minimal API que vas a construir en este capítulo. `-n` nombra tanto el proyecto como la carpeta que crea.
+- `dotnet sln add ...` **no ocurre automáticamente**: crear un proyecto y registrarlo en la solución son dos pasos separados. Sin este comando, `Taskboard.Api` existiría en el disco pero `dotnet build` a nivel de solución lo ignoraría.
+
+Y el proyecto de Angular, como carpeta hermana de `Taskboard.Api` (no dentro de ella):
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
 ng new taskboard-web --standalone --routing --style=scss --skip-git
 ```
 </CodeBlock>
 
-Instala Entity Framework Core con el proveedor de SQLite y las herramientas de migración:
+Cada flag es una decisión explícita, no un valor arbitrario:
 
-<CodeBlock lang="bash" title="Taskboard.Api/">
+| Flag | Qué hace | Por qué lo usamos aquí |
+| --- | --- | --- |
+| `--standalone` | Genera componentes sin `NgModule` | Es el enfoque que vas a usar en toda la guía, a partir de la parte 1 |
+| `--routing` | Crea `app.routes.ts` con el Router configurado | Este quickstart no navega entre páginas todavía, pero lo necesitarás desde la parte 5 (pantalla de login) |
+| `--style=scss` | Usa Sass en vez de CSS plano para las hojas de estilo | Sass te da variables y anidamiento sin coste — puedes escribir CSS normal dentro de un archivo `.scss` si no lo necesitas aún |
+| `--skip-git` | No inicializa un repositorio git dentro de `taskboard-web/` | `ng new` crea su propio repo por defecto; lo evitamos porque `taskboard/` en su conjunto será un único repositorio |
+
+Angular CLI te va a preguntar interactivamente sobre Server-Side Rendering (SSR) — responde que no (`N`) por ahora; es el tema que se menciona brevemente en la parte 0 y que queda fuera del alcance de este curso.
+
+### Añade EF Core y las herramientas de migración
+
+Con los dos proyectos creados, instala en `Taskboard.Api` lo necesario para hablar con una base de datos:
+
+<CodeBlock lang="bash" title="Terminal">
 ```bash
 cd Taskboard.Api
 dotnet add package Microsoft.EntityFrameworkCore.Sqlite --version 8.*
@@ -162,17 +196,28 @@ cd ..
 ```
 </CodeBlock>
 
-La estructura inicial queda así:
+Son tres piezas distintas, y vale la pena distinguirlas:
 
+- **`Microsoft.EntityFrameworkCore.Sqlite`** es el *proveedor*: la pieza que sabe traducir las operaciones de EF Core al SQL específico de SQLite. Cada motor de base de datos necesita su propio proveedor — en la parte 4 vas a sustituir este paquete por `Npgsql.EntityFrameworkCore.PostgreSQL` sin cambiar ninguna otra línea de código.
+- **`Microsoft.EntityFrameworkCore.Design`** trae las herramientas necesarias **solo en tiempo de desarrollo** para generar migraciones (`dotnet ef migrations add`, que verás en el paso 5). No la necesita la aplicación cuando corre en producción, pero sí el propio comando `dotnet ef` para inspeccionar tu proyecto y generar el código de la migración.
+- **`dotnet tool install --global dotnet-ef`** es distinto a los dos anteriores: no es un paquete NuGet que se referencia desde el `.csproj`, sino una **herramienta de línea de comandos** que se instala una sola vez en tu máquina (`--global`) y queda disponible como `dotnet ef` en cualquier proyecto, no solo en Taskboard.
+
+### La estructura que acabas de crear
+
+<CodeBlock lang="text" title="taskboard/">
 ```text
-Taskboard/
-├── Taskboard.sln
+taskboard/
+├── Taskboard.sln              — agrupa los proyectos .NET de la solución
 ├── Taskboard.Api/
-│   ├── Program.cs
-│   └── Taskboard.Api.csproj
+│   ├── Program.cs             — punto de entrada de la API (ahora mismo, casi vacío)
+│   └── Taskboard.Api.csproj   — referencias del proyecto: paquetes NuGet, versión de .NET
 └── taskboard-web/
-    └── src/app/
+    ├── src/app/                — componentes, servicios y configuración de Angular
+    └── package.json            — dependencias de Node y scripts (ng serve, ng build...)
 ```
+</CodeBlock>
+
+Backend y frontend no se conocen entre sí a nivel de archivos — la única conexión entre ambos, desde ahora hasta el final del curso, va a ser HTTP.
 
 ## 2. Modela el dominio
 
