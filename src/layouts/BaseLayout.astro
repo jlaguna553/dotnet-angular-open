@@ -1,0 +1,20 @@
+---
+interface Props {
+  title: string;
+  description?: string;
+}
+const { title, description = 'Curso abierto de desarrollo full stack con .NET 8 y Angular 17+.' } = Astro.props;
+---
+<!doctype html>
+<html lang="es" class="bg-paper text-ink">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>◈</text></svg>" />
+    <title>{title} · .NET Angular Open</title>
+  </head>
+  <body class="min-h-screen bg-paper font-sans antialiased selection:bg-coral selection:text-white">
+    <slot />
+  </body>
+</html>

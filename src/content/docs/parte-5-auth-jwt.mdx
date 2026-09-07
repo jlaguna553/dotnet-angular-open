@@ -1,0 +1,366 @@
+---
+title: "Autenticación: ASP.NET Identity, JWT y guards en Angular"
+description: "Protege la API con ASP.NET Identity y tokens JWT, implementa refresh tokens, y haz cumplir la autenticación en Angular con un interceptor funcional y guards de ruta."
+part: 5
+duration: "5–7 horas"
+tags:
+  - dotnet-8
+  - jwt
+  - angular
+  - seguridad
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Hasta ahora, cualquiera que conozca la URL puede crear, editar o borrar tareas. En este capítulo vas a exigir que cada petición demuestre quién la hace, usando JWT — la elección natural para una API sin estado (recuerda el principio de la parte 0: *stateless*).
+
+## Por qué JWT y no sesiones en el servidor
+
+Una sesión tradicional guarda un identificador en una cookie y el estado real (quién es el usuario) en memoria o una tabla del lado del servidor. Eso viola el principio *stateless* de REST: el servidor tiene que recordar algo entre peticiones, lo que complica escalar horizontalmente (todas las instancias necesitarían compartir ese estado).
+
+Un **JSON Web Token** invierte la responsabilidad: el propio token contiene la información necesaria (quién es el usuario, qué rol tiene, cuándo expira), firmada criptográficamente por el servidor. El servidor no guarda nada — solo verifica la firma en cada petición.
+
+```text
+Login exitoso  →  el servidor firma un JWT y lo devuelve
+Cada petición  →  el cliente envía el JWT en el header Authorization
+                    → el servidor verifica la firma (sin consultar nada)
+```
+
+El costo: un JWT no puede "revocarse" a mitad de su vida útil de la misma forma que borrar una fila de sesión — de ahí la necesidad de tiempos de expiración cortos y **refresh tokens**, que veremos más abajo.
+
+## Instala ASP.NET Identity y la infraestructura de JWT
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet add package Microsoft.AspNetCore.Identity.EntityFrameworkCore --version 8.*
+dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer --version 8.*
+```
+</CodeBlock>
+
+Extiende el `DbContext` para incluir las tablas de Identity (usuarios, roles, tokens):
+
+<CodeBlock lang="csharp" title="Data/TaskDbContext.cs (fragmento)">
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+
+public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options)
+    : IdentityDbContext<IdentityUser>(options)
+{
+    public DbSet<TaskItem> Tasks => Set<TaskItem>();
+    public DbSet<Project> Projects => Set<Project>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder); // registra las tablas de Identity primero
+        // ... resto de la configuración de TaskItem y Project
+    }
+}
+```
+</CodeBlock>
+
+## El servicio que emite tokens
+
+<CodeBlock lang="csharp" title="Auth/TokenService.cs">
+```csharp
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.IdentityModel.Tokens;
+
+namespace Taskboard.Api.Auth;
+
+public sealed record TokenPair(string AccessToken, string RefreshToken, DateTime AccessTokenExpiresAt);
+
+public sealed class TokenService(IConfiguration configuration)
+{
+    public TokenPair CreateTokenPair(IdentityUser user)
+    {
+        var expiresAt = DateTime.UtcNow.AddMinutes(15); // vida corta a propósito
+
+        var claims = new[]
+        {
+            new Claim(JwtRegisteredClaimNames.Sub, user.Id),
+            new Claim(JwtRegisteredClaimNames.Email, user.Email ?? string.Empty),
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+        };
+
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(configuration["Jwt:Secret"]!));
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        var token = new JwtSecurityToken(
+            issuer: configuration["Jwt:Issuer"],
+            audience: configuration["Jwt:Audience"],
+            claims: claims,
+            expires: expiresAt,
+            signingCredentials: credentials);
+
+        var accessToken = new JwtSecurityTokenHandler().WriteToken(token);
+        var refreshToken = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(64));
+
+        return new TokenPair(accessToken, refreshToken, expiresAt);
+    }
+}
+```
+</CodeBlock>
+
+El `refreshToken` es intencionalmente **opaco** (bytes aleatorios, no un JWT) — no necesita ser auto-descriptivo porque nunca se envía a nadie más que al propio servidor, que lo valida contra una tabla.
+
+<CodeBlock lang="csharp" title="Models/RefreshToken.cs">
+```csharp
+namespace Taskboard.Api.Models;
+
+public sealed class RefreshToken
+{
+    public int Id { get; set; }
+    public required string Token { get; set; }
+    public required string UserId { get; set; }
+    public DateTime ExpiresAt { get; set; }
+    public bool IsRevoked { get; set; }
+}
+```
+</CodeBlock>
+
+## Configura el pipeline de autenticación
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+builder.Services.AddIdentityCore<IdentityUser>(options =>
+{
+    options.Password.RequiredLength = 8;
+    options.User.RequireUniqueEmail = true;
+})
+.AddEntityFrameworkStores<TaskDbContext>();
+
+builder.Services.AddScoped<TokenService>();
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidAudience = builder.Configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Secret"]!)),
+            ClockSkew = TimeSpan.Zero, // sin margen extra de expiración
+        };
+    });
+
+builder.Services.AddAuthorization();
+```
+</CodeBlock>
+
+Y en el pipeline, **el orden importa** — igual que en la parte 3, `UseAuthentication` debe ir antes que `UseAuthorization`, y ambos antes de mapear los endpoints:
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+app.UseCors("AngularDev");
+app.UseAuthentication(); // ¿quién eres? — verifica el token
+app.UseAuthorization();  // ¿qué puedes hacer? — verifica permisos
+app.MapTaskEndpoints();
+```
+</CodeBlock>
+
+## Endpoints de autenticación
+
+<CodeBlock lang="csharp" title="Endpoints/AuthEndpoints.cs">
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Taskboard.Api.Auth;
+
+namespace Taskboard.Api.Endpoints;
+
+public sealed record RegisterRequest(string Email, string Password);
+public sealed record LoginRequest(string Email, string Password);
+public sealed record AuthResponse(string AccessToken, string RefreshToken, DateTime ExpiresAt);
+
+public static class AuthEndpoints
+{
+    public static RouteGroupBuilder MapAuthEndpoints(this IEndpointRouteBuilder routes)
+    {
+        var group = routes.MapGroup("/api/auth").WithTags("Auth");
+
+        group.MapPost("/register", async (
+            RegisterRequest request, UserManager<IdentityUser> userManager) =>
+        {
+            var user = new IdentityUser { UserName = request.Email, Email = request.Email };
+            var result = await userManager.CreateAsync(user, request.Password);
+
+            return result.Succeeded
+                ? Results.Created($"/api/auth/users/{user.Id}", new { user.Id, user.Email })
+                : Results.ValidationProblem(result.Errors.ToDictionary(
+                    error => error.Code, error => new[] { error.Description }));
+        });
+
+        group.MapPost("/login", async (
+            LoginRequest request, UserManager<IdentityUser> userManager, TokenService tokenService) =>
+        {
+            var user = await userManager.FindByEmailAsync(request.Email);
+            if (user is null || !await userManager.CheckPasswordAsync(user, request.Password))
+            {
+                return Results.Unauthorized();
+            }
+
+            var tokens = tokenService.CreateTokenPair(user);
+            return Results.Ok(new AuthResponse(tokens.AccessToken, tokens.RefreshToken, tokens.AccessTokenExpiresAt));
+        });
+
+        return group;
+    }
+}
+```
+</CodeBlock>
+
+`Results.Unauthorized()` deliberadamente **no distingue** entre "el email no existe" y "la contraseña es incorrecta" — devolver mensajes distintos para cada caso le regala a un atacante la capacidad de enumerar qué correos están registrados.
+
+## Protege los endpoints existentes
+
+Con un `.RequireAuthorization()` encadenado al grupo, los cuatro endpoints de tareas exigen un token válido:
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs (fragmento)">
+```csharp
+var group = routes.MapGroup("/api/tasks")
+    .WithTags("Tasks")
+    .RequireAuthorization();
+```
+</CodeBlock>
+
+Sin un `Authorization: Bearer <token>` válido, cualquier petición a `/api/tasks` ahora devuelve `401 Unauthorized` antes de que el endpoint llegue a ejecutarse.
+
+## Angular: interceptor para adjuntar el token
+
+Reutilizamos exactamente el mecanismo de interceptor funcional de la parte 2, ahora con un propósito distinto:
+
+<CodeBlock lang="typescript" title="src/app/interceptors/auth.interceptor.ts">
+```typescript
+import { HttpInterceptorFn } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { AuthService } from '../services/auth.service';
+
+export const authInterceptor: HttpInterceptorFn = (request, next) => {
+  const auth = inject(AuthService);
+  const token = auth.accessToken();
+
+  if (!token || !request.url.startsWith('/api')) {
+    return next(request);
+  }
+
+  return next(request.clone({
+    setHeaders: { Authorization: `Bearer ${token}` },
+  }));
+};
+```
+</CodeBlock>
+
+`request.clone()` es obligatorio: los objetos `HttpRequest` son inmutables en Angular, así que no puedes mutar los headers directamente — clonas la petición original añadiendo el header nuevo.
+
+## `AuthService`: estado de sesión con signals
+
+<CodeBlock lang="typescript" title="src/app/services/auth.service.ts">
+```typescript
+import { HttpClient } from '@angular/common/http';
+import { Injectable, computed, inject, signal } from '@angular/core';
+import { Observable, tap } from 'rxjs';
+
+interface AuthResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: string;
+}
+
+const STORAGE_KEY = 'taskboard.refreshToken';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  private readonly http = inject(HttpClient);
+
+  readonly accessToken = signal<string | null>(null);
+  readonly isAuthenticated = computed(() => this.accessToken() !== null);
+
+  login(email: string, password: string): Observable<AuthResponse> {
+    return this.http.post<AuthResponse>('/api/auth/login', { email, password }).pipe(
+      tap((response) => {
+        this.accessToken.set(response.accessToken);
+        localStorage.setItem(STORAGE_KEY, response.refreshToken);
+      }),
+    );
+  }
+
+  logout(): void {
+    this.accessToken.set(null);
+    localStorage.removeItem(STORAGE_KEY);
+  }
+}
+```
+</CodeBlock>
+
+Nota deliberada: el **access token** vive solo en memoria (un signal), nunca en `localStorage`. El **refresh token** sí persiste, porque necesita sobrevivir a un refresh de página. Guardar el access token en `localStorage` lo expondría a cualquier script inyectado vía XSS; en memoria, desaparece si recargas la página — el costo aceptable es que necesitas usar el refresh token para obtener un access token nuevo al arrancar la aplicación.
+
+## Guard funcional de ruta
+
+<CodeBlock lang="typescript" title="src/app/guards/auth.guard.ts">
+```typescript
+import { inject } from '@angular/core';
+import { CanActivateFn, Router } from '@angular/router';
+import { AuthService } from '../services/auth.service';
+
+export const authGuard: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  if (auth.isAuthenticated()) {
+    return true;
+  }
+
+  router.navigate(['/login']);
+  return false;
+};
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="src/app/app.routes.ts">
+```typescript
+import { Routes } from '@angular/router';
+import { authGuard } from './guards/auth.guard';
+
+export const routes: Routes = [
+  { path: 'login', loadComponent: () => import('./pages/login/login.component').then((m) => m.LoginComponent) },
+  {
+    path: '',
+    canActivate: [authGuard],
+    loadComponent: () => import('./app.component').then((m) => m.AppComponent),
+  },
+];
+```
+</CodeBlock>
+
+Un guard funcional (`CanActivateFn`, desde Angular 14.1) es simplemente una función — no una clase que implementa una interfaz, como en versiones anteriores de Angular. Devuelve `true` para permitir la navegación, `false` (o un `UrlTree`, para redirigir) para bloquearla.
+
+## Ejercicios
+
+1. Implementa el endpoint `POST /api/auth/refresh`, que reciba un `refreshToken`, lo valide contra la tabla, y devuelva un `TokenPair` nuevo — revocando el refresh token usado (los refresh tokens deben ser de un solo uso).
+2. Añade lógica al interceptor para, ante un `401`, intentar automáticamente un refresh antes de reintentar la petición original.
+3. Crea un `roleGuard` que además del login exija un rol específico (`Admin`), usando `RequireAuthorization("AdminOnly")` en el backend con una policy basada en claims.
+4. Investiga por qué `ClockSkew = TimeSpan.Zero` es una elección deliberada en este capítulo, y qué problema evita frente al valor por defecto de 5 minutos.
+5. Explica, en un párrafo, por qué guardar el access token en una cookie `HttpOnly` sería una alternativa más segura que guardarlo en memoria — y qué te costaría implementarla (pista: CSRF).
+
+## Checklist de salida
+
+- [ ] `POST /api/auth/register` y `POST /api/auth/login` funcionan contra ASP.NET Identity.
+- [ ] Los endpoints de `/api/tasks` devuelven `401` sin un token válido.
+- [ ] El interceptor de Angular adjunta el token a cada petición hacia `/api`.
+- [ ] Existe un guard de ruta que redirige a `/login` si no hay sesión.
+- [ ] Puedes explicar por qué el access token vive en memoria y el refresh token en `localStorage`, no al revés.
+
+En la parte 6 vas a añadir una capa de caché con Redis delante de las consultas más costosas, y a entender el patrón cache-aside que vas a reutilizar en cualquier sistema que necesite escalar lecturas.

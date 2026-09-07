@@ -1,0 +1,17 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+.dark { color-scheme: dark; }
+.dark body, .dark .bg-paper { background: #102027; color: #edf6f0; }
+.dark .text-ink { color: #edf6f0; }
+.dark .text-ink\/65 { color: rgb(237 246 240 / 0.65); }
+.dark .text-ink\/70 { color: rgb(237 246 240 / 0.7); }
+.dark .border-ink\/10 { border-color: rgb(237 246 240 / 0.12); }
+.dark .border-ink\/15 { border-color: rgb(237 246 240 / 0.18); }
+.dark .bg-white { background: #19313a; }
+html { scroll-behavior: smooth; }
+.prose pre code { font-family: 'JetBrains Mono', monospace; }
+.prose :where(code):not(:where([class~='not-prose'] *))::before, .prose :where(code):not(:where([class~='not-prose'] *))::after { content: ''; }

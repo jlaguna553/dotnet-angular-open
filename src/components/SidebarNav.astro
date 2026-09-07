@@ -1,0 +1,36 @@
+---
+const modules = [
+  ['00', 'Fundamentos web', 'parte-0-fundamentos'],
+  ['00.5', 'Quickstart CRUD', 'parte-0-5-quickstart-crud'],
+  ['01', 'Angular moderno', 'parte-1-angular-moderno'],
+  ['02', 'HTTP y formularios', 'parte-2-http-formularios'],
+  ['03', '.NET Minimal APIs', 'parte-3-net-minimal-apis'],
+  ['04', 'Entity Framework Core', 'parte-4-ef-core'],
+  ['05', 'Auth con JWT', 'parte-5-auth-jwt'],
+  ['06', 'Redis', 'parte-6-redis'],
+  ['07', 'Estado con Signals', 'parte-7-estado-signals'],
+  ['08', 'SignalR', 'parte-8-signalr'],
+  ['09', 'GraphQL', 'parte-9-graphql'],
+  ['10', 'Clean Architecture', 'parte-10-clean-architecture'],
+  ['11', 'Testing', 'parte-11-testing'],
+  ['12', 'Docker', 'parte-12-docker'],
+];
+const currentSlug = Astro.url.pathname.split('/').filter(Boolean).pop();
+---
+<aside class="hidden w-72 shrink-0 lg:block">
+  <div class="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto pr-5">
+    <p class="mb-4 px-3 text-[11px] font-bold uppercase tracking-[0.2em] text-coral">Ruta del curso</p>
+    <nav aria-label="Módulos del curso" class="space-y-1">
+      {modules.map(([number, title, slug]) => (
+        <a href={`/docs/${slug}`} class:list={["group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition", currentSlug === slug ? 'bg-ink text-white shadow-soft' : 'text-ink/65 hover:bg-ink/5 hover:text-ink']}>
+          <span class:list={["w-9 font-mono text-xs", currentSlug === slug ? 'text-mint' : 'text-ink/35 group-hover:text-coral']}>{number}</span>
+          <span>{title}</span>
+        </a>
+      ))}
+    </nav>
+    <div class="mt-8 rounded-2xl bg-mint p-5 text-ink">
+      <p class="font-display text-lg font-bold">Aprende haciendo.</p>
+      <p class="mt-2 text-sm leading-relaxed text-ink/70">Cada parte termina con una pieza que puedes desplegar y enseñar.</p>
+    </div>
+  </div>
+</aside>

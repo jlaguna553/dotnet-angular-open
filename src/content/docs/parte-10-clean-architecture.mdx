@@ -1,0 +1,308 @@
+---
+title: "Clean Architecture, CQRS y MediatR"
+description: "Reestructura Taskboard.Api en capas de Dominio, Aplicación e Infraestructura, separa lecturas de escrituras con CQRS, y usa MediatR y FluentValidation para que cada caso de uso sea una clase explícita."
+part: 10
+duration: "5–6 horas"
+tags:
+  - clean-architecture
+  - cqrs
+  - mediatr
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Hasta ahora, `TaskEndpoints.cs` mezcla tres responsabilidades en el mismo método: validar la entrada, ejecutar la lógica de negocio, y hablar con EF Core. Funciona bien para cuatro endpoints. En este capítulo vas a separar esas responsabilidades en capas explícitas — no porque el proyecto lo necesite hoy, sino para que entiendas el patrón antes de enfrentarlo en un proyecto donde sí es indispensable.
+
+## Las capas, y la regla que las sostiene
+
+```text
+Taskboard.Domain          (entidades, sin dependencias de nada externo)
+     ▲
+Taskboard.Application     (casos de uso, interfaces de repositorios — depende de Domain)
+     ▲
+Taskboard.Infrastructure  (EF Core, Redis, SignalR — implementa las interfaces de Application)
+     ▲
+Taskboard.Api             (endpoints, composición — depende de todas las anteriores)
+```
+
+La regla de dependencia es unidireccional y **hacia adentro**: `Domain` no sabe que EF Core existe. `Application` conoce interfaces (`ITaskRepository`), no implementaciones. Solo `Infrastructure` conoce Entity Framework, Redis o SignalR concretamente. Esto es lo que te permitiría, en teoría, reemplazar EF Core por Dapper sin tocar una sola línea de `Application` — el valor real no es la flexibilidad hipotética de cambiar de ORM, sino que **cada capa se testea sin las de afuera**.
+
+## Crea los proyectos
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet new classlib -n Taskboard.Domain
+dotnet new classlib -n Taskboard.Application
+dotnet new classlib -n Taskboard.Infrastructure
+
+dotnet sln add Taskboard.Domain Taskboard.Application Taskboard.Infrastructure
+
+dotnet add Taskboard.Application reference Taskboard.Domain
+dotnet add Taskboard.Infrastructure reference Taskboard.Application
+dotnet add Taskboard.Api reference Taskboard.Application Taskboard.Infrastructure
+```
+</CodeBlock>
+
+Fíjate qué **no** hicimos: `Taskboard.Api` no referencia `Taskboard.Domain` directamente (le llega transitivamente vía `Application`), y ningún proyecto excepto `Infrastructure` referencia paquetes de EF Core.
+
+## Domain: la entidad, sin anotaciones de framework
+
+<CodeBlock lang="csharp" title="Taskboard.Domain/TaskItem.cs">
+```csharp
+namespace Taskboard.Domain;
+
+public sealed class TaskItem
+{
+    public int Id { get; private set; }
+    public string Title { get; private set; }
+    public bool IsCompleted { get; private set; }
+    public DateTime CreatedAt { get; private set; }
+
+    private TaskItem() { Title = string.Empty; } // requerido por EF Core
+
+    public static TaskItem Create(string title)
+    {
+        var trimmed = title.Trim();
+        if (trimmed.Length is < 1 or > 160)
+        {
+            throw new ArgumentException("El título debe tener entre 1 y 160 caracteres.", nameof(title));
+        }
+
+        return new TaskItem
+        {
+            Title = trimmed,
+            CreatedAt = DateTime.UtcNow,
+        };
+    }
+
+    public void Complete() => IsCompleted = true;
+    public void Reopen() => IsCompleted = false;
+}
+```
+</CodeBlock>
+
+Esta es una diferencia deliberada frente a `TaskItem` de la parte 0.5: ahora los setters son privados, y `Create`/`Complete`/`Reopen` son los únicos caminos válidos para mutar el estado. La entidad **se protege a sí misma** — es imposible construir un `TaskItem` con un título vacío en cualquier parte del código, porque el constructor no es público.
+
+## Application: interfaces, no implementaciones
+
+<CodeBlock lang="csharp" title="Taskboard.Application/ITaskRepository.cs">
+```csharp
+using Taskboard.Domain;
+
+namespace Taskboard.Application;
+
+public interface ITaskRepository
+{
+    Task<List<TaskItem>> GetAllAsync(CancellationToken cancellationToken);
+    Task<TaskItem?> GetByIdAsync(int id, CancellationToken cancellationToken);
+    Task AddAsync(TaskItem task, CancellationToken cancellationToken);
+    Task SaveChangesAsync(CancellationToken cancellationToken);
+}
+```
+</CodeBlock>
+
+`Application` define el **contrato** que necesita, sin saber (ni importarle) si detrás hay EF Core, Dapper o un archivo JSON. Esto es lo que hace posible testear los casos de uso con una implementación falsa en memoria, sin base de datos real — lo verás en la parte 11.
+
+## CQRS: separa comandos de consultas
+
+CQRS (*Command Query Responsibility Segregation*) es la idea de que **leer** y **escribir** son operaciones con necesidades distintas, y modelarlas como clases separadas — en vez de un único "servicio de tareas" con diez métodos mezclados — hace cada una más simple de entender y testear.
+
+<CodeBlock lang="csharp" title="Taskboard.Application/Tasks/CreateTaskCommand.cs">
+```csharp
+using MediatR;
+using Taskboard.Domain;
+
+namespace Taskboard.Application.Tasks;
+
+public sealed record CreateTaskCommand(string Title) : IRequest<TaskItem>;
+
+public sealed class CreateTaskCommandHandler(ITaskRepository repository)
+    : IRequestHandler<CreateTaskCommand, TaskItem>
+{
+    public async Task<TaskItem> Handle(CreateTaskCommand request, CancellationToken cancellationToken)
+    {
+        var task = TaskItem.Create(request.Title);
+        await repository.AddAsync(task, cancellationToken);
+        await repository.SaveChangesAsync(cancellationToken);
+        return task;
+    }
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Taskboard.Application/Tasks/GetAllTasksQuery.cs">
+```csharp
+using MediatR;
+using Taskboard.Domain;
+
+namespace Taskboard.Application.Tasks;
+
+public sealed record GetAllTasksQuery : IRequest<List<TaskItem>>;
+
+public sealed class GetAllTasksQueryHandler(ITaskRepository repository)
+    : IRequestHandler<GetAllTasksQuery, List<TaskItem>>
+{
+    public Task<List<TaskItem>> Handle(GetAllTasksQuery request, CancellationToken cancellationToken) =>
+        repository.GetAllAsync(cancellationToken);
+}
+```
+</CodeBlock>
+
+Cada caso de uso es ahora **una clase con una sola razón para cambiar**. Comparar esto con el endpoint monolítico de la parte 0.5 hace visible la ganancia: `CreateTaskCommandHandler` se puede instanciar y testear con un `ITaskRepository` falso, sin levantar Kestrel ni una base de datos.
+
+## MediatR: el despachador
+
+MediatR es la librería que conecta un `IRequest` con su handler correspondiente, sin que quien envía el comando conozca la clase concreta que lo maneja:
+
+<CodeBlock lang="bash" title="Terminal (en Taskboard.Application)">
+```bash
+dotnet add package MediatR --version 12.*
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddMediatR(config =>
+    config.RegisterServicesFromAssembly(typeof(CreateTaskCommand).Assembly));
+```
+</CodeBlock>
+
+El endpoint queda reducido a lo que realmente le corresponde a la capa HTTP: traducir la petición a un mensaje, y la respuesta del handler a un `IResult`.
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs (Create con MediatR)">
+```csharp
+group.MapPost("/", async (CreateTaskRequest request, ISender sender, CancellationToken cancellationToken) =>
+{
+    var task = await sender.Send(new CreateTaskCommand(request.Title), cancellationToken);
+    var response = new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt);
+    return TypedResults.Created($"/api/tasks/{task.Id}", response);
+});
+```
+</CodeBlock>
+
+## FluentValidation + *pipeline behavior*: validar antes de que el handler se ejecute
+
+En lugar de repetir `if (title.Length is < 1 or > 160) throw ...` en cada comando, MediatR permite interceptar **todos** los mensajes con un *pipeline behavior* — el mismo concepto de "cadena" que viste con middleware HTTP en la parte 3, ahora a nivel de mensajes internos.
+
+<CodeBlock lang="bash" title="Terminal (en Taskboard.Application)">
+```bash
+dotnet add package FluentValidation.DependencyInjectionExtensions --version 11.*
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Taskboard.Application/Tasks/CreateTaskCommandValidator.cs">
+```csharp
+using FluentValidation;
+
+namespace Taskboard.Application.Tasks;
+
+public sealed class CreateTaskCommandValidator : AbstractValidator<CreateTaskCommand>
+{
+    public CreateTaskCommandValidator()
+    {
+        RuleFor(command => command.Title)
+            .NotEmpty().WithMessage("El título es obligatorio.")
+            .MaximumLength(160).WithMessage("El título no puede superar los 160 caracteres.");
+    }
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Taskboard.Application/Behaviors/ValidationBehavior.cs">
+```csharp
+using FluentValidation;
+using MediatR;
+
+namespace Taskboard.Application.Behaviors;
+
+public sealed class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidator<TRequest>> validators)
+    : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : notnull
+{
+    public async Task<TResponse> Handle(
+        TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken cancellationToken)
+    {
+        if (!validators.Any())
+        {
+            return await next();
+        }
+
+        var failures = validators
+            .Select(validator => validator.Validate(request))
+            .SelectMany(result => result.Errors)
+            .Where(error => error is not null)
+            .ToList();
+
+        if (failures.Count != 0)
+        {
+            throw new ValidationException(failures);
+        }
+
+        return await next();
+    }
+}
+```
+</CodeBlock>
+
+Regístralo como un comportamiento genérico — se aplica automáticamente a **cualquier** comando o consulta que tenga un validador registrado, sin tocar los handlers:
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddValidatorsFromAssembly(typeof(CreateTaskCommandValidator).Assembly);
+builder.Services.AddTransient(
+    typeof(IPipelineBehavior<,>), typeof(ValidationBehavior<,>));
+```
+</CodeBlock>
+
+Con esto, `CreateTaskCommandHandler.Handle` ya no necesita validar nada — para cuando su código se ejecuta, MediatR garantiza que el comando ya pasó todas las reglas de `CreateTaskCommandValidator`. La validación de la parte 0.5 (`if (title.Length is ...)`) queda reemplazada por una regla declarativa, centralizada y reutilizable entre `CreateTaskCommand` y cualquier comando futuro que la necesite.
+
+## Infrastructure: la única capa que conoce EF Core
+
+<CodeBlock lang="csharp" title="Taskboard.Infrastructure/TaskRepository.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Application;
+using Taskboard.Domain;
+
+namespace Taskboard.Infrastructure;
+
+public sealed class TaskRepository(TaskDbContext database) : ITaskRepository
+{
+    public Task<List<TaskItem>> GetAllAsync(CancellationToken cancellationToken) =>
+        database.Tasks.AsNoTracking().OrderByDescending(task => task.CreatedAt).ToListAsync(cancellationToken);
+
+    public Task<TaskItem?> GetByIdAsync(int id, CancellationToken cancellationToken) =>
+        database.Tasks.FirstOrDefaultAsync(task => task.Id == id, cancellationToken);
+
+    public async Task AddAsync(TaskItem task, CancellationToken cancellationToken) =>
+        await database.Tasks.AddAsync(task, cancellationToken);
+
+    public Task SaveChangesAsync(CancellationToken cancellationToken) =>
+        database.SaveChangesAsync(cancellationToken);
+}
+```
+</CodeBlock>
+
+`TaskDbContext` se mueve a `Taskboard.Infrastructure`, junto con toda la configuración de EF Core de las partes 0.5 y 4 — `Application` nunca importa `Microsoft.EntityFrameworkCore`.
+
+## ¿Esto es demasiado para Taskboard?
+
+Sinceramente, sí — para una aplicación de cuatro endpoints, cuatro proyectos y MediatR son ceremonia que no se paga a sí misma. La razón para construirlo aquí es pedagógica: cuando un proyecto real crezca a 40 casos de uso con reglas de negocio no triviales, vas a reconocer inmediatamente cuándo esta estructura empieza a pagar su costo — típicamente, cuando "¿dónde pongo esta lógica?" deja de tener una respuesta obvia con una arquitectura más simple.
+
+## Ejercicios
+
+1. Migra los cuatro endpoints de tareas (crear, listar, actualizar, eliminar) al patrón Command/Query + Handler de este capítulo.
+2. Escribe `UpdateTaskStatusCommand` con su propio validador, que rechace transiciones inválidas (por ejemplo, si decides que una tarea "archivada" no puede reabrirse).
+3. Añade un segundo `IPipelineBehavior` que loguee el nombre de cada comando/consulta y su tiempo de ejecución — el equivalente, a nivel de MediatR, del middleware de la parte 3.
+4. Escribe una implementación falsa de `ITaskRepository` (una lista en memoria) y úsala para instanciar `CreateTaskCommandHandler` sin ningún framework de testing todavía — solo comprueba a mano que produce el resultado esperado.
+5. Explica en dos o tres frases por qué `Taskboard.Domain` no debería tener ninguna referencia de paquete NuGet, ni siquiera a MediatR.
+
+## Checklist de salida
+
+- [ ] Los cuatro proyectos existen con las referencias correctas: `Api → {Application, Infrastructure}`, `Infrastructure → Application`, `Application → Domain`.
+- [ ] `TaskItem` protege sus invariantes con un constructor privado y métodos de dominio (`Create`, `Complete`, `Reopen`).
+- [ ] Cada caso de uso es un `IRequest`/`IRequestHandler` independiente, sin lógica de HTTP dentro.
+- [ ] La validación ocurre en un `ValidationBehavior` centralizado, no repetida en cada handler.
+- [ ] Puedes explicar la regla de dependencia unidireccional sin mirar el diagrama.
+
+En la parte 11 vas a escribir tests reales sobre esta arquitectura: xUnit y Moq para testear handlers en aislamiento, `WebApplicationFactory` para tests de integración de extremo a extremo, y Vitest/Playwright del lado de Angular.

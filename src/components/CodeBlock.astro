@@ -1,0 +1,33 @@
+---
+interface Props { lang?: string; title?: string; }
+const { lang, title } = Astro.props;
+const languageNames: Record<string, string> = {
+  csharp: 'C#', typescript: 'TypeScript', javascript: 'JavaScript', html: 'HTML',
+  bash: 'Shell', json: 'JSON', sql: 'SQL', yaml: 'YAML', text: 'Texto',
+};
+---
+<div class="code-shell my-6 overflow-hidden rounded-2xl bg-[#17252b] shadow-soft" data-code-block>
+  <div class="flex items-center justify-between border-b border-white/10 px-4 py-3 text-xs text-white/55">
+    <div class="flex items-center gap-3">
+      <span class="flex gap-1.5"><i class="size-2 rounded-full bg-[#ff7665]"></i><i class="size-2 rounded-full bg-[#f4c95d]"></i><i class="size-2 rounded-full bg-[#72d6a4]"></i></span>
+      <span>{title ?? (lang ? languageNames[lang] ?? lang : '')}</span>
+    </div>
+    <button type="button" class="copy-code rounded-lg px-2 py-1 font-semibold text-mint transition hover:bg-white/10">Copiar</button>
+  </div>
+  <div class="code-body overflow-x-auto text-[13px] leading-6 [&_pre]:!m-0 [&_pre]:!bg-transparent [&_pre]:!p-5">
+    <slot />
+  </div>
+</div>
+<script>
+  document.querySelectorAll<HTMLElement>('[data-code-block]').forEach((block) => {
+    const button = block.querySelector<HTMLButtonElement>('.copy-code');
+    const pre = block.querySelector('pre');
+    if (!button || !pre) return;
+    button.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(pre.textContent ?? '');
+      const original = button.textContent;
+      button.textContent = 'Copiado';
+      setTimeout(() => { button.textContent = original; }, 1400);
+    });
+  });
+</script>

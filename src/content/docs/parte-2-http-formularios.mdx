@@ -1,0 +1,266 @@
+---
+title: "HTTP y formularios: RxJS y Reactive Forms"
+description: "Sustituye ngModel por Reactive Forms con validación declarativa, añade búsqueda con debounce, y aprende los operadores de RxJS que vas a usar en cada proyecto Angular."
+part: 2
+duration: "4–5 horas"
+tags:
+  - angular
+  - rxjs
+  - reactive-forms
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+`TaskFormComponent` de la parte 1 funciona, pero no valida nada: un título de un solo espacio en blanco pasa el `trim()` del lado del cliente pero no te avisa *antes* de enviarlo. Reactive Forms resuelve esto con un modelo declarativo de validación que vive en TypeScript, no disperso en atributos HTML.
+
+## Por qué "Reactive" y no solo "Forms"
+
+Angular tiene dos APIs de formularios que puedes importar según necesites: **Template-driven** (lo que usaste con `[(ngModel)]`) y **Reactive**. La diferencia no es solo de sintaxis:
+
+| | Template-driven | Reactive |
+| --- | --- | --- |
+| Fuente de verdad | El DOM | Un objeto `FormGroup` en TypeScript |
+| Validación | Directivas en el HTML | Funciones `Validators` declarativas |
+| Testeable sin renderizar | No | Sí |
+| Composición dinámica | Difícil | Natural (`FormArray`, `FormGroup` anidados) |
+
+Para un campo de texto suelto, `ngModel` está bien. Para un formulario con reglas ("el título es obligatorio y tiene máximo 160 caracteres", "la prioridad debe ser una de tres opciones"), Reactive Forms te da algo que puedes testear con un objeto plano, sin montar el componente.
+
+## Reescribe `TaskFormComponent` con `FormGroup`
+
+<CodeBlock lang="typescript" title="src/app/components/task-form/task-form.component.ts">
+```typescript
+import { Component, EventEmitter, Output } from '@angular/core';
+import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+
+@Component({
+  selector: 'app-task-form',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  templateUrl: './task-form.component.html',
+})
+export class TaskFormComponent {
+  @Output() created = new EventEmitter<string>();
+
+  private readonly formBuilder = new FormBuilder();
+
+  readonly form = this.formBuilder.nonNullable.group({
+    title: ['', [Validators.required, Validators.minLength(1), Validators.maxLength(160)]],
+  });
+
+  get title() {
+    return this.form.controls.title;
+  }
+
+  submit(): void {
+    if (this.form.invalid) {
+      this.form.markAllAsTouched();
+      return;
+    }
+    this.created.emit(this.form.getRawValue().title.trim());
+    this.form.reset();
+  }
+}
+```
+</CodeBlock>
+
+`nonNullable.group(...)` evita que TypeScript infiera `string | null` para cada control — sin él, cada lectura del valor requeriría comprobar `null` aunque el formulario nunca vaya a estar vacío por diseño. `markAllAsTouched()` fuerza a que se muestren los errores incluso si el usuario nunca tocó el campo (por ejemplo, si le da a "Añadir" con el campo vacío desde el principio).
+
+<CodeBlock lang="html" title="src/app/components/task-form/task-form.component.html">
+```html
+<form class="composer" [formGroup]="form" (ngSubmit)="submit()">
+  <label for="new-task">Nueva tarea</label>
+  <div class="composer-row">
+    <input id="new-task" formControlName="title"
+      placeholder="Ej. Publicar la API" maxlength="160" />
+    <button type="submit">Añadir</button>
+  </div>
+
+  @if (title.invalid && title.touched) {
+    <p class="field-error" role="alert">
+      @if (title.errors?.['required']) {
+        El título es obligatorio.
+      }
+      @if (title.errors?.['maxlength']) {
+        El título no puede superar los 160 caracteres.
+      }
+    </p>
+  }
+</form>
+```
+</CodeBlock>
+
+`formControlName="title"` conecta el `<input>` con el control `title` del `FormGroup` — es el equivalente reactivo de `[(ngModel)]`, pero la fuente de verdad es el objeto `form`, no el DOM.
+
+## `FormGroup` con reglas cruzadas: valida en el edge, no solo en el input
+
+Añade prioridad al formulario, con una regla que depende de dos campos a la vez:
+
+<CodeBlock lang="typescript" title="Validador personalizado">
+```typescript
+import { AbstractControl, ValidationErrors } from '@angular/forms';
+
+export function highPriorityNeedsNote(control: AbstractControl): ValidationErrors | null {
+  const priority = control.get('priority')?.value;
+  const note = control.get('note')?.value as string;
+
+  if (priority === 'high' && !note?.trim()) {
+    return { highPriorityNeedsNote: true };
+  }
+  return null;
+}
+```
+</CodeBlock>
+
+```typescript
+readonly form = this.formBuilder.nonNullable.group(
+  {
+    title: ['', [Validators.required, Validators.maxLength(160)]],
+    priority: ['normal' as 'low' | 'normal' | 'high'],
+    note: [''],
+  },
+  { validators: highPriorityNeedsNote },
+);
+```
+
+Los validadores a nivel de grupo (segundo argumento de `group()`) son la herramienta correcta cuando la regla no pertenece a un solo campo — intentar meterla en el validador de `note` obligaría a ese control a conocer el valor de `priority`, acoplando dos campos que deberían poder validarse por separado.
+
+## RxJS: los operadores que vas a usar siempre
+
+`HttpClient.get()` devuelve un `Observable`, no una `Promise`. La diferencia clave: un Observable es **cancelable** y puede emitir múltiples valores a lo largo del tiempo — perfecto para eventos de UI como "el usuario está escribiendo en un campo de búsqueda".
+
+### Búsqueda con `debounceTime` + `switchMap`
+
+<CodeBlock lang="typescript" title="src/app/components/task-search/task-search.component.ts">
+```typescript
+import { Component, EventEmitter, Output, inject } from '@angular/core';
+import { FormControl, ReactiveFormsModule } from '@angular/forms';
+import { debounceTime, distinctUntilChanged, switchMap } from 'rxjs';
+import { Task } from '../../models/task';
+import { TaskApiService } from '../../services/task-api.service';
+
+@Component({
+  selector: 'app-task-search',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  templateUrl: './task-search.component.html',
+})
+export class TaskSearchComponent {
+  private readonly taskApi = inject(TaskApiService);
+  @Output() results = new EventEmitter<Task[]>();
+
+  readonly query = new FormControl('', { nonNullable: true });
+
+  constructor() {
+    this.query.valueChanges
+      .pipe(
+        debounceTime(300),
+        distinctUntilChanged(),
+        switchMap((term) => this.taskApi.search(term)),
+      )
+      .subscribe((tasks) => this.results.emit(tasks));
+  }
+}
+```
+</CodeBlock>
+
+Cada operador resuelve un problema concreto:
+
+- **`debounceTime(300)`**: espera 300ms de silencio antes de emitir. Sin esto, cada tecla dispararía una petición HTTP.
+- **`distinctUntilChanged()`**: si el usuario escribe y borra hasta volver al mismo texto, no repite la petición.
+- **`switchMap`**: al llegar un término nuevo, **cancela** la petición anterior si sigue en vuelo y empieza una nueva. Es la pieza que evita el bug clásico de "resultados viejos que llegan tarde y pisan a los nuevos" (*race condition*) — si usaras `mergeMap` en su lugar, ambas peticiones seguirían corriendo y la respuesta más lenta podría sobrescribir a la más reciente.
+
+El servicio expone el método `search` igual que los otros, delegando el parámetro de consulta a la query string:
+
+<CodeBlock lang="typescript" title="src/app/services/task-api.service.ts (añade este método)">
+```typescript
+search(term: string): Observable<Task[]> {
+  const params = new HttpParams().set('q', term);
+  return this.http.get<Task[]>(this.resourceUrl, { params });
+}
+```
+</CodeBlock>
+
+`HttpParams` construye la query string de forma inmutable y con el escapado correcto — evita concatenar strings manualmente (`${this.resourceUrl}?q=${term}`), que rompe con caracteres como `&` o espacios sin codificar.
+
+## Manejo de errores con `catchError`
+
+Hasta ahora manejaste errores dentro del `subscribe({ error: ... })`. Eso funciona para un caso aislado, pero no compone bien si quieres, por ejemplo, reintentar automáticamente o transformar el error antes de que llegue al componente. `catchError` vive en el propio pipeline:
+
+<CodeBlock lang="typescript" title="src/app/services/task-api.service.ts (getAll con manejo de errores)">
+```typescript
+import { Observable, catchError, throwError, timeout } from 'rxjs';
+
+getAll(): Observable<Task[]> {
+  return this.http.get<Task[]>(this.resourceUrl).pipe(
+    timeout(5000),
+    catchError((error) => {
+      console.error('Fallo al cargar tareas', error);
+      return throwError(() => new Error('No pudimos cargar las tareas. Intenta de nuevo.'));
+    }),
+  );
+}
+```
+</CodeBlock>
+
+`timeout(5000)` convierte una petición colgada (servidor caído, red lenta) en un error explícito a los 5 segundos, en lugar de dejar al usuario esperando indefinidamente. `catchError` intercepta cualquier error del pipeline —incluido el que genera `timeout`— y lo transforma en un mensaje que tiene sentido para quien consuma el Observable, sin filtrar detalles internos (como el objeto `HttpErrorResponse` completo) hacia la UI.
+
+## Interceptor: un lugar para lógica transversal
+
+Un `HttpInterceptor` funcional envuelve **todas** las peticiones salientes. Es el lugar correcto para lógica que no pertenece a ningún endpoint en particular — por ejemplo, mostrar un indicador de carga global:
+
+<CodeBlock lang="typescript" title="src/app/interceptors/logging.interceptor.ts">
+```typescript
+import { HttpInterceptorFn } from '@angular/common/http';
+import { tap } from 'rxjs';
+
+export const loggingInterceptor: HttpInterceptorFn = (request, next) => {
+  const startedAt = performance.now();
+  return next(request).pipe(
+    tap({
+      next: () => console.log(`${request.method} ${request.url} → ${Math.round(performance.now() - startedAt)}ms`),
+      error: (error) => console.error(`${request.method} ${request.url} falló`, error),
+    }),
+  );
+};
+```
+</CodeBlock>
+
+Regístralo en `app.config.ts`:
+
+<CodeBlock lang="typescript" title="src/app/app.config.ts">
+```typescript
+import { ApplicationConfig } from '@angular/core';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { routes } from './app.routes';
+import { loggingInterceptor } from './interceptors/logging.interceptor';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(routes),
+    provideHttpClient(withInterceptors([loggingInterceptor])),
+  ],
+};
+```
+</CodeBlock>
+
+Este es el mecanismo que en la parte 5 vas a reutilizar para adjuntar un token JWT a cada petición saliente, sin tocar ni un solo componente.
+
+## Ejercicios
+
+1. Añade un `<select formControlName="priority">` con las opciones `low`, `normal`, `high` al formulario, y muestra un error si el usuario intenta poner prioridad `high` sin escribir una nota (usa el validador cruzado de este capítulo).
+2. Implementa `TaskSearchComponent` completo (falta el template) y conéctalo a `AppComponent` para filtrar la lista visible.
+3. Cambia `switchMap` por `mergeMap` en la búsqueda y provoca deliberadamente una carrera de datos escribiendo rápido — confirma que ves el bug, luego revierte el cambio.
+4. Escribe un interceptor que añada un encabezado `X-Client: taskboard-web` a cada petición saliente.
+5. Investiga la diferencia entre `switchMap`, `mergeMap`, `concatMap` y `exhaustMap`, y decide cuál usarías para un botón de "Guardar" que no debería permitir doble clic mientras la petición está en curso.
+
+## Checklist de salida
+
+- [ ] El formulario de Taskboard usa `FormGroup` con `Validators` y muestra errores de validación en la UI.
+- [ ] Puedes explicar qué problema resuelve `switchMap` frente a no cancelar peticiones anteriores.
+- [ ] Sabes cuándo usar un validador de campo vs. un validador de grupo.
+- [ ] Tienes al menos un interceptor funcional registrado en `app.config.ts`.
+- [ ] Puedes explicar la diferencia entre manejar un error en `subscribe({ error })` y con el operador `catchError`.
+
+Con el frontend fortalecido, en la parte 3 vamos a volver al backend para profundizar en Minimal APIs: grupos de rutas, middleware personalizado, Swagger y manejo de errores centralizado.

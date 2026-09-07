@@ -1,0 +1,242 @@
+---
+title: "Docker: empaqueta el sistema completo"
+description: "Un Dockerfile multi-stage para la API .NET, otro para Angular servido con nginx, y un docker-compose.yml que levanta API, frontend, PostgreSQL y Redis con un solo comando."
+part: 12
+duration: "3–4 horas"
+tags:
+  - docker
+  - docker-compose
+  - despliegue
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Hasta ahora corriste todo localmente: `dotnet run` en una terminal, `npm start` en otra, Postgres y Redis en contenedores sueltos que lanzaste a mano en las partes 4 y 6. Este capítulo cierra el círculo: todo el sistema arranca con `docker compose up`, igual en tu máquina que en cualquier servidor.
+
+## Por qué multi-stage: separar "construir" de "correr"
+
+Un `Dockerfile` ingenuo instalaría el SDK completo de .NET (cientos de MB, con compiladores y herramientas) en la imagen final que corre en producción — necesarias para *compilar*, inútiles y pesadas para *ejecutar*. Un build multi-stage usa una imagen para compilar y copia **solo el resultado** a una imagen final mucho más pequeña:
+
+```text
+Stage "build"  (SDK completo, ~800MB)  →  compila y publica
+                                              │ COPY --from=build
+                                              ▼
+Stage final    (runtime, ~110MB)       →  solo lo necesario para ejecutar
+```
+
+## Dockerfile de la API (.NET 8)
+
+<CodeBlock lang="text" title="Taskboard.Api/Dockerfile">
+```text
+# Etapa 1: build — usa el SDK completo, con compiladores y herramientas de NuGet
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+# Copia solo los .csproj primero: si el código cambia pero no las dependencias,
+# Docker reutiliza la capa de "restore" del caché, sin volver a descargar paquetes.
+COPY Taskboard.Api/*.csproj Taskboard.Api/
+COPY Taskboard.Application/*.csproj Taskboard.Application/
+COPY Taskboard.Domain/*.csproj Taskboard.Domain/
+COPY Taskboard.Infrastructure/*.csproj Taskboard.Infrastructure/
+RUN dotnet restore Taskboard.Api/Taskboard.Api.csproj
+
+COPY . .
+RUN dotnet publish Taskboard.Api/Taskboard.Api.csproj -c Release -o /app --no-restore
+
+# Etapa 2: runtime — solo el runtime de ASP.NET, sin SDK ni herramientas de build
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+WORKDIR /app
+
+RUN useradd --uid 1000 taskboard
+USER taskboard
+
+COPY --from=build /app .
+
+EXPOSE 8080
+ENV ASPNETCORE_URLS=http://+:8080
+ENTRYPOINT ["dotnet", "Taskboard.Api.dll"]
+```
+</CodeBlock>
+
+Dos decisiones merecen explicación:
+
+- **Copiar los `.csproj` antes que el resto del código**: Docker cachea cada instrucción `RUN`/`COPY` por separado. Si solo cambias un archivo `.cs`, la capa de `dotnet restore` (la más lenta, porque descarga paquetes de NuGet) se reutiliza del caché en lugar de rehacerse — el build siguiente tarda segundos en lugar de minutos.
+- **`useradd` + `USER taskboard`**: por defecto, un contenedor corre como `root`. Si un atacante compromete la aplicación, correr como un usuario sin privilegios limita lo que puede hacer dentro del propio contenedor — un principio básico de defensa en profundidad, no específico de .NET.
+
+## Dockerfile de Angular (build + nginx)
+
+<CodeBlock lang="text" title="taskboard-web/Dockerfile">
+```text
+# Etapa 1: build — compila el bundle de producción con Node
+FROM node:20-alpine AS build
+WORKDIR /src
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build -- --configuration production
+
+# Etapa 2: runtime — sirve los archivos estáticos con nginx, sin Node en la imagen final
+FROM nginx:1.27-alpine AS final
+COPY --from=build /src/dist/taskboard-web/browser /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+```
+</CodeBlock>
+
+`npm ci` (en lugar de `npm install`) instala exactamente las versiones fijadas en `package-lock.json`, sin resolver rangos de versiones de nuevo — determinismo entre tu máquina y el build de producción, que `npm install` no garantiza.
+
+Angular compilado es HTML/JS/CSS estático — no necesita un servidor Node en producción. nginx sirve esos archivos más rápido y con muchísima menos superficie de ataque que mantener un runtime de Node corriendo.
+
+<CodeBlock lang="text" title="taskboard-web/nginx.conf">
+```text
+server {
+    listen 80;
+
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://api:8080/api/;
+        proxy_set_header Host $host;
+    }
+
+    location /hubs/ {
+        proxy_pass http://api:8080/hubs/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+```
+</CodeBlock>
+
+`try_files $uri $uri/ /index.html` es la pieza indispensable para una SPA con Angular Router: si el usuario recarga la página en `/tareas/7`, no existe ningún archivo `tareas/7` en el disco — nginx debe servir igualmente `index.html` y dejar que el Router de Angular interprete la URL del lado del cliente. Sin esta línea, recargar cualquier ruta que no sea `/` devuelve un `404` de nginx.
+
+Los bloques `location /api/` y `location /hubs/` reemplazan, en producción, al proxy de desarrollo (`proxy.conf.json`) que usaste desde la parte 0.5 — el mismo problema (que el navegador vea un solo origen), resuelto por una pieza de infraestructura distinta según el entorno.
+
+## `docker-compose.yml`: el sistema completo, un comando
+
+<CodeBlock lang="yaml" title="docker-compose.yml">
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: taskboard
+      POSTGRES_USER: taskboard
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-taskboard_dev_only}
+    volumes:
+      - taskboard-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Taskboard.Api/Dockerfile
+    environment:
+      ConnectionStrings__Taskboard: "Host=db;Database=taskboard;Username=taskboard;Password=${DB_PASSWORD:-taskboard_dev_only}"
+      ConnectionStrings__Redis: "redis:6379"
+      Jwt__Secret: ${JWT_SECRET:?la variable JWT_SECRET es obligatoria}
+      Jwt__Issuer: "taskboard-api"
+      Jwt__Audience: "taskboard-web"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5000:8080"
+
+  web:
+    build:
+      context: ./taskboard-web
+    depends_on:
+      - api
+    ports:
+      - "4200:80"
+
+volumes:
+  taskboard-db-data:
+```
+</CodeBlock>
+
+Piezas que vale la pena señalar:
+
+- **`healthcheck` + `depends_on: condition: service_healthy`**: `depends_on` por sí solo solo espera a que el contenedor **arranque**, no a que Postgres esté realmente aceptando conexiones. Sin el healthcheck, la API podría intentar conectarse a la base de datos antes de que esté lista y fallar en el arranque — con él, Docker Compose espera a que `pg_isready` confirme que Postgres ya acepta conexiones.
+- **`${JWT_SECRET:?mensaje}`**: la sintaxis `:?` de Compose falla explícitamente con ese mensaje si la variable no está definida, en lugar de arrancar silenciosamente con un secreto vacío o de ejemplo — preferible a un valor por defecto inseguro para algo tan sensible como la clave de firma de JWT.
+- **`taskboard-db-data`**: un volumen nombrado persiste los datos de Postgres **fuera** del ciclo de vida del contenedor — puedes hacer `docker compose down` y `up` de nuevo sin perder los datos; solo `docker compose down -v` los eliminaría.
+
+## `.env` para las variables locales
+
+<CodeBlock lang="text" title=".env (no lo subas a git)">
+```text
+DB_PASSWORD=un_password_local_cualquiera
+JWT_SECRET=una-clave-secreta-de-al-menos-32-caracteres-para-firmar-jwt
+```
+</CodeBlock>
+
+Docker Compose carga `.env` automáticamente si existe en el mismo directorio. Añádelo a `.gitignore` — es exactamente el mismo principio de la parte 5 sobre no versionar secretos, aplicado ahora a la configuración de todo el sistema, no solo a la API.
+
+## Levanta todo
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+echo "DB_PASSWORD=taskboard_dev_only" > .env
+echo "JWT_SECRET=$(openssl rand -base64 32)" >> .env
+
+docker compose up --build
+```
+</CodeBlock>
+
+La primera vez construye ambas imágenes desde cero (varios minutos); las siguientes reutilizan las capas cacheadas del Dockerfile y arrancan en segundos. Visita `http://localhost:4200` — Angular, servido por nginx, habla con la API a través del proxy interno de nginx, que a su vez habla con Postgres y Redis, todos dentro de la misma red que Compose crea automáticamente para estos servicios.
+
+## `.dockerignore`: no copies lo que no necesitas
+
+<CodeBlock lang="text" title=".dockerignore">
+```text
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/.angular
+.git
+.env
+```
+</CodeBlock>
+
+Sin esto, `COPY . .` en el Dockerfile arrastraría `node_modules` o `bin`/`obj` locales hacia el contexto de build — infla el tamaño de la imagen, ralentiza cada build, y en el peor caso puede filtrar artefactos compilados en tu máquina (con una arquitectura de CPU distinta a la del contenedor) hacia la imagen final.
+
+## Ejercicios
+
+1. Construye ambos Dockerfiles y confirma con `docker images` que la imagen final de la API pesa significativamente menos que si usaras `mcr.microsoft.com/dotnet/sdk:8.0` como imagen final.
+2. Añade un `healthcheck` al propio servicio `api` en el compose (por ejemplo, contra un endpoint `/health`) y usa `depends_on: condition: service_healthy` en `web` para no servir el frontend hasta que la API esté realmente lista.
+3. Añade un archivo `.env.example` (sin valores reales) documentando qué variables espera el sistema, y confirma que `.env` sigue ignorado por git.
+4. Investiga qué es un *distroless* o una imagen `chiseled` de .NET (`mcr.microsoft.com/dotnet/aspnet:8.0-jammy-chiseled`) y por qué reduce aún más la superficie de ataque frente a la imagen `aspnet:8.0` estándar de este capítulo.
+5. Con el sistema completo corriendo vía Compose, repite el smoke test de curl de la parte 0.5 contra `http://localhost:5000`, y el test E2E de Playwright de la parte 11 contra `http://localhost:4200` — confirma que ambos pasan igual que en desarrollo local.
+
+## Checklist de salida
+
+- [ ] `docker compose up --build` levanta API, Angular, Postgres y Redis con un solo comando.
+- [ ] La imagen final de la API no contiene el SDK completo de .NET, solo el runtime.
+- [ ] Recargar una ruta interna de Angular (no `/`) no produce un 404 de nginx.
+- [ ] Los secretos (`JWT_SECRET`, `DB_PASSWORD`) viven en `.env`, ignorado por git, no hardcodeados en `docker-compose.yml`.
+- [ ] Puedes explicar qué problema resuelve un `healthcheck` que `depends_on` por sí solo no resuelve.
+
+Has recorrido las trece partes: desde el ciclo petición-respuesta más básico hasta un sistema completo, autenticado, en tiempo real, testeado y containerizado. El código que construiste en cada capítulo sigue siendo la misma aplicación, Taskboard — cada parte le añadió una capa real, no un ejemplo desechable. A partir de aquí, el siguiente paso es tuyo: un dominio distinto, las mismas piezas.

@@ -1,0 +1,223 @@
+---
+title: "Caching distribuido con Redis"
+description: "El patrón cache-aside aplicado a la API de tareas, invalidación de caché en escrituras, y una introducción a pub/sub como base para lo que construirás con SignalR en la parte 8."
+part: 6
+duration: "3–4 horas"
+tags:
+  - redis
+  - caching
+  - dotnet-8
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+`GET /api/tasks` ejecuta una consulta a la base de datos en cada petición, incluso si nada cambió desde la última vez. Para una tabla pequeña esto es irrelevante — pero es exactamente el tipo de decisión que deja de ser irrelevante cuando el tráfico crece. Este capítulo introduce Redis como caché delante de esa consulta, con el patrón más común y más mal entendido: **cache-aside**.
+
+## Por qué un caché distribuido y no `MemoryCache`
+
+.NET trae `IMemoryCache` integrado, que guarda datos en la memoria del propio proceso. Funciona, pero tiene un límite estructural: si despliegas la API en **dos o más instancias** (algo casi garantizado en producción, para tolerancia a fallos), cada instancia tiene su propia copia de la caché, desincronizada de las demás. Un caché distribuido como Redis vive **fuera** de cualquier instancia — todas comparten los mismos datos cacheados.
+
+```text
+Sin Redis:
+  Instancia A ──[caché local A]
+  Instancia B ──[caché local B]   (¡desincronizadas!)
+
+Con Redis:
+  Instancia A ─┐
+               ├──► [Redis] (una sola fuente de verdad para el caché)
+  Instancia B ─┘
+```
+
+## Levanta Redis local
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+docker run --name taskboard-redis -p 6379:6379 -d redis:7-alpine
+```
+</CodeBlock>
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet add package Microsoft.Extensions.Caching.StackExchangeRedis --version 8.*
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis");
+    options.InstanceName = "taskboard:";
+});
+```
+</CodeBlock>
+
+<CodeBlock lang="json" title="appsettings.Development.json (fragmento)">
+```json
+{
+  "ConnectionStrings": {
+    "Redis": "localhost:6379"
+  }
+}
+```
+</CodeBlock>
+
+Esto registra `IDistributedCache` en el contenedor de dependencias — la abstracción que vas a inyectar, sin acoplar tu código directamente a la librería de Redis.
+
+## El patrón cache-aside
+
+La idea es simple, pero el orden de las operaciones es lo que la hace correcta: **la aplicación**, no la caché, decide cuándo leer de la base de datos y cuándo actualizar el caché.
+
+```text
+Lectura:
+  1. ¿Está en caché?  → si sí, devuélvelo (cache hit)
+  2. Si no             → consulta la base de datos (cache miss)
+  3. Guarda el resultado en caché con un TTL
+  4. Devuélvelo
+
+Escritura:
+  1. Escribe en la base de datos (fuente de verdad)
+  2. Invalida (borra) la entrada de caché correspondiente
+```
+
+<CodeBlock lang="csharp" title="Services/TaskCacheService.cs">
+```csharp
+using System.Text.Json;
+using Microsoft.Extensions.Caching.Distributed;
+using Taskboard.Api.Contracts;
+
+namespace Taskboard.Api.Services;
+
+public sealed class TaskCacheService(IDistributedCache cache)
+{
+    private const string ListCacheKey = "tasks:all";
+    private static readonly DistributedCacheEntryOptions CacheOptions = new()
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30),
+    };
+
+    public async Task<List<TaskResponse>?> GetCachedListAsync(CancellationToken cancellationToken)
+    {
+        var cached = await cache.GetStringAsync(ListCacheKey, cancellationToken);
+        return cached is null ? null : JsonSerializer.Deserialize<List<TaskResponse>>(cached);
+    }
+
+    public async Task SetCachedListAsync(List<TaskResponse> tasks, CancellationToken cancellationToken)
+    {
+        var serialized = JsonSerializer.Serialize(tasks);
+        await cache.SetStringAsync(ListCacheKey, serialized, CacheOptions, cancellationToken);
+    }
+
+    public Task InvalidateListAsync(CancellationToken cancellationToken) =>
+        cache.RemoveAsync(ListCacheKey, cancellationToken);
+}
+```
+</CodeBlock>
+
+Un TTL (*time to live*) de 30 segundos es una elección deliberada: acota cuánto tiempo puede vivir un dato obsoleto en el peor caso, incluso si por algún motivo la invalidación explícita fallara. Nunca cachees sin un TTL — un caché sin expiración es, eventualmente, un bug de datos obsoletos esperando a ocurrir.
+
+### Úsalo en el endpoint de lectura
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs (GetAll actualizado)">
+```csharp
+private static async Task<Ok<List<TaskResponse>>> GetAll(
+    TaskDbContext database, TaskCacheService cacheService, CancellationToken cancellationToken)
+{
+    var cached = await cacheService.GetCachedListAsync(cancellationToken);
+    if (cached is not null)
+    {
+        return TypedResults.Ok(cached);
+    }
+
+    var tasks = await database.Tasks
+        .AsNoTracking()
+        .OrderByDescending(task => task.CreatedAt)
+        .Select(task => new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt))
+        .ToListAsync(cancellationToken);
+
+    await cacheService.SetCachedListAsync(tasks, cancellationToken);
+    return TypedResults.Ok(tasks);
+}
+```
+</CodeBlock>
+
+### Invalida en cada escritura
+
+Cada endpoint que modifica tareas (`Create`, `UpdateStatus`, `Remove`) debe invalidar el caché — de lo contrario, un usuario vería datos obsoletos hasta que expire el TTL:
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs (Create actualizado)">
+```csharp
+private static async Task<Results<Created<TaskResponse>, ValidationProblem>> Create(
+    CreateTaskRequest request, TaskDbContext database, TaskCacheService cacheService,
+    CancellationToken cancellationToken)
+{
+    // ... validación y creación como en la parte 3 ...
+
+    database.Tasks.Add(task);
+    await database.SaveChangesAsync(cancellationToken);
+    await cacheService.InvalidateListAsync(cancellationToken); // invalida, no actualices el caché a mano
+
+    var response = new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt);
+    return TypedResults.Created($"/api/tasks/{task.Id}", response);
+}
+```
+</CodeBlock>
+
+Nota que **invalidamos** (borramos) el caché en lugar de intentar actualizarlo con el nuevo estado. Actualizar el caché directamente parece más eficiente, pero introduce una superficie de bugs mucho mayor: hay que reconstruir exactamente el mismo estado que produciría una relectura, en cada punto de escritura, para siempre. Borrar y dejar que la siguiente lectura repueble el caché es más simple y, en la práctica, casi siempre igual de rápido.
+
+## El problema que el cache-aside no resuelve: *cache stampede*
+
+Si el TTL expira justo cuando hay 500 peticiones concurrentes, las 500 pueden golpear la base de datos simultáneamente antes de que la primera termine de repoblar el caché. Para Taskboard esto es un problema teórico, pero vale la pena conocer la mitigación estándar: un *lock* distribuido (o `SemaphoreSlim` local, si tienes una sola instancia) que garantice que solo una petición repuebla el caché mientras las demás esperan ese resultado en lugar de golpear la base de datos por su cuenta.
+
+## Pub/Sub: la otra mitad de Redis
+
+Redis no es solo una caché clave-valor — también es un *message broker* ligero via `PUBLISH`/`SUBSCRIBE`. Cuando una instancia de la API crea una tarea, puede publicar un evento que **todas** las demás instancias reciben, sin necesidad de que se conozcan entre sí:
+
+<CodeBlock lang="csharp" title="Services/TaskEventPublisher.cs">
+```csharp
+using StackExchange.Redis;
+
+namespace Taskboard.Api.Services;
+
+public sealed class TaskEventPublisher(IConnectionMultiplexer redis)
+{
+    private const string Channel = "taskboard:task-created";
+
+    public async Task PublishTaskCreatedAsync(int taskId)
+    {
+        var subscriber = redis.GetSubscriber();
+        await subscriber.PublishAsync(RedisChannel.Literal(Channel), taskId.ToString());
+    }
+}
+```
+</CodeBlock>
+
+Regístralo junto al resto de servicios de Redis:
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
+builder.Services.AddScoped<TaskEventPublisher>();
+```
+</CodeBlock>
+
+Este mismo mecanismo es la base conceptual de lo que vas a construir con SignalR en la parte 8: cuando tengas múltiples instancias de la API, un `PUBLISH` en Redis es cómo le avisas a la instancia que tiene la conexión WebSocket de un cliente específico que algo cambió en otra instancia.
+
+## Ejercicios
+
+1. Implementa `TaskCacheService` y `GetAll` con caché tal como en este capítulo, y confirma con logs que la segunda petición consecutiva a `GET /api/tasks` es un *cache hit* (no ejecuta SQL).
+2. Añade invalidación de caché a `UpdateStatus` y `Remove`, que hoy en el capítulo solo se muestra para `Create`.
+3. Usa `redis-cli` (`docker exec -it taskboard-redis redis-cli`) para inspeccionar manualmente la clave `taskboard:tasks:all` con `GET` y su tiempo de vida restante con `TTL`.
+4. Cambia el TTL a 5 segundos y observa, cronometrando manualmente, cuánto tarda un cambio en reflejarse si "olvidas" invalidar el caché en un endpoint a propósito.
+5. Investiga qué es un `SemaphoreSlim` en C# y esboza (sin implementarlo) cómo lo usarías para mitigar un *cache stampede* en `GetAll`.
+
+## Checklist de salida
+
+- [ ] `GET /api/tasks` lee de Redis cuando hay un *cache hit*, y de la base de datos cuando hay un *cache miss*.
+- [ ] Cada endpoint de escritura invalida la entrada de caché correspondiente.
+- [ ] Puedes explicar por qué invalidar es preferible a actualizar el caché directamente, en la mayoría de los casos.
+- [ ] Sabes qué es un *cache stampede* y por qué el TTL corto no lo elimina por sí solo.
+- [ ] Entiendes la diferencia entre usar Redis como caché clave-valor y usarlo como *message broker* con pub/sub.
+
+En la parte 7 vas a llevar el manejo de estado en Angular más allá de signals sueltos: `computed` y `effect` avanzados, y NgRx SignalStore para estado compartido entre componentes que no tienen relación padre-hijo directa.

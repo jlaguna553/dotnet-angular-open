@@ -1,0 +1,251 @@
+---
+title: "Estado avanzado: Signals y NgRx SignalStore"
+description: "computed y effect más allá de lo básico, el problema del estado compartido entre componentes sin relación directa, y cómo NgRx SignalStore lo resuelve sin el ceremonial de NgRx clásico."
+part: 7
+duration: "4–5 horas"
+tags:
+  - angular
+  - signals
+  - ngrx
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+En la parte 1 usaste signals sueltos dentro de `AppComponent`. Funciona mientras todo el estado vive en un solo componente y se pasa hacia abajo por `@Input`. Pero, ¿qué pasa cuando `TaskSearchComponent` (parte 2) y un futuro `TaskStatsComponent` en la barra lateral necesitan leer y modificar **la misma** lista de tareas, sin ser padre e hijo directos?
+
+## El problema: estado que no cabe en una jerarquía de `@Input`
+
+```text
+AppComponent
+ ├── HeaderComponent
+ │    └── TaskStatsComponent   ← necesita leer `tasks`
+ ├── TaskSearchComponent        ← necesita leer y filtrar `tasks`
+ └── TaskListComponent          ← necesita leer y modificar `tasks`
+```
+
+Pasar `tasks` como `@Input` a cada uno, y cada mutación como `@Output` de vuelta hacia `AppComponent`, funciona pero degenera rápido en lo que se conoce como *prop drilling*: cada componente intermedio tiene que reenviar props que ni siquiera usa, solo para que lleguen al nieto que sí las necesita.
+
+## `computed`: derivar, nunca duplicar
+
+Antes de llegar a la solución de estado compartido, hay una regla que evita la mitad de los bugs de sincronización: **si un valor puede calcularse a partir de otro, no lo guardes por separado — deriva con `computed`**.
+
+<CodeBlock lang="typescript" title="Antipatrón vs. patrón correcto">
+```typescript
+// MAL: dos signals que pueden desincronizarse
+readonly tasks = signal<Task[]>([]);
+readonly pendingCount = signal(0); // ¿quién garantiza que esto siga sincronizado con `tasks`?
+
+// BIEN: un solo signal de estado, todo lo demás se deriva
+readonly tasks = signal<Task[]>([]);
+readonly pendingCount = computed(() => this.tasks().filter((task) => !task.isCompleted).length);
+readonly completionRate = computed(() => {
+  const total = this.tasks().length;
+  return total === 0 ? 0 : Math.round(((total - this.pendingCount()) / total) * 100);
+});
+```
+</CodeBlock>
+
+`completionRate` depende de `pendingCount`, que a su vez depende de `tasks` — Angular resuelve esa cadena de dependencias automáticamente y solo recalcula lo que realmente cambió. Si `tasks` no cambia, ningún `computed` de la cadena se vuelve a ejecutar, sin importar cuántas veces se re-renderice el componente.
+
+## `effect`: la salida deliberada del mundo reactivo
+
+Un `effect` ejecuta código con efectos secundarios (loguear, sincronizar con `localStorage`, llamar a una API externa) cada vez que cambia alguno de los signals que lee. Es la excepción a la regla, no la herramienta por defecto — si puedes resolver algo con `computed`, usa `computed`.
+
+<CodeBlock lang="typescript" title="Sincronizar con localStorage">
+```typescript
+import { Component, effect, signal } from '@angular/core';
+
+@Component({ /* ... */ })
+export class TaskFiltersComponent {
+  readonly showCompleted = signal(
+    localStorage.getItem('taskboard.showCompleted') !== 'false',
+  );
+
+  constructor() {
+    effect(() => {
+      localStorage.setItem('taskboard.showCompleted', String(this.showCompleted()));
+    });
+  }
+}
+```
+</CodeBlock>
+
+Una trampa común: **mutar dentro de un `effect` el mismo signal que el efecto lee** crea un bucle infinito. Angular detecta este caso específico y lanza un error en desarrollo, pero la regla general —un efecto reacciona a cambios, no los origina en el mismo signal que observa— evita el problema por diseño.
+
+## `linkedSignal`: estado derivado que también se puede sobrescribir
+
+Angular 19 introdujo `linkedSignal` para un caso intermedio entre `signal` y `computed`: un valor que normalmente se deriva de otro, pero que el usuario puede sobrescribir manualmente sin romper la relación cuando la fuente vuelve a cambiar.
+
+<CodeBlock lang="typescript" title="Selección que se resetea cuando cambia la lista">
+```typescript
+import { linkedSignal, signal } from '@angular/core';
+
+readonly tasks = signal<Task[]>([]);
+
+// Por defecto selecciona la primera tarea; si el usuario elige otra manualmente,
+// esa elección se respeta — pero si `tasks` cambia, vuelve a calcularse desde cero.
+readonly selectedTaskId = linkedSignal(() => this.tasks().at(0)?.id ?? null);
+```
+</CodeBlock>
+
+Con un `computed` normal no podrías hacer `selectedTaskId.set(otroId)` — es de solo lectura. Con `signal` normal perderías la sincronización automática cuando `tasks` cambia. `linkedSignal` te da ambas cosas.
+
+## NgRx SignalStore: estado compartido sin el ceremonial clásico
+
+Si conoces NgRx clásico (actions, reducers, effects, selectors), SignalStore es deliberadamente más simple: un store es una clase inyectable construida con la función `signalStore()`, cuyo estado interno son signals.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+npm install @ngrx/signals
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="src/app/state/task.store.ts">
+```typescript
+import { computed, inject } from '@angular/core';
+import { signalStore, withState, withMethods, withComputed, patchState } from '@ngrx/signals';
+import { rxMethod } from '@ngrx/signals/rxjs-interop';
+import { pipe, switchMap, tap, catchError, of } from 'rxjs';
+import { Task } from '../models/task';
+import { TaskApiService } from '../services/task-api.service';
+
+interface TaskState {
+  tasks: Task[];
+  isLoading: boolean;
+  errorMessage: string | null;
+}
+
+const initialState: TaskState = {
+  tasks: [],
+  isLoading: false,
+  errorMessage: null,
+};
+
+export const TaskStore = signalStore(
+  { providedIn: 'root' },
+  withState(initialState),
+  withComputed(({ tasks }) => ({
+    pendingCount: computed(() => tasks().filter((task) => !task.isCompleted).length),
+    completedCount: computed(() => tasks().filter((task) => task.isCompleted).length),
+  })),
+  withMethods((store, taskApi = inject(TaskApiService)) => ({
+    load: rxMethod<void>(
+      pipe(
+        tap(() => patchState(store, { isLoading: true, errorMessage: null })),
+        switchMap(() =>
+          taskApi.getAll().pipe(
+            tap((tasks) => patchState(store, { tasks, isLoading: false })),
+            catchError(() => {
+              patchState(store, { isLoading: false, errorMessage: 'No pudimos cargar las tareas.' });
+              return of(null);
+            }),
+          ),
+        ),
+      ),
+    ),
+    toggle(task: Task): void {
+      taskApi.updateStatus(task.id, !task.isCompleted).subscribe({
+        next: () => patchState(store, {
+          tasks: store.tasks().map((item) =>
+            item.id === task.id ? { ...item, isCompleted: !item.isCompleted } : item),
+        }),
+      });
+    },
+    remove(task: Task): void {
+      taskApi.remove(task.id).subscribe({
+        next: () => patchState(store, {
+          tasks: store.tasks().filter((item) => item.id !== task.id),
+        }),
+      });
+    },
+  })),
+);
+```
+</CodeBlock>
+
+Piezas clave:
+
+- **`withState`** define el estado inicial — cada propiedad se convierte automáticamente en un signal de solo lectura accesible como `store.tasks()`.
+- **`withComputed`** define valores derivados, igual que `computed()` suelto, pero como parte del store — visibles como `store.pendingCount()`.
+- **`patchState`** es la única forma de mutar el estado: fusiona parcialmente el objeto que le pases, de forma inmutable. No hay setters directos.
+- **`rxMethod`** conecta un pipeline de RxJS (como el `switchMap` que ya conoces de la parte 2) con el store, gestionando la suscripción automáticamente.
+
+## Consúmelo desde cualquier componente, sin `@Input`
+
+<CodeBlock lang="typescript" title="src/app/components/task-list/task-list.component.ts">
+```typescript
+import { Component, OnInit, inject } from '@angular/core';
+import { TaskStore } from '../../state/task.store';
+import { TaskItemComponent } from '../task-item/task-item.component';
+
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskItemComponent],
+  templateUrl: './task-list.component.html',
+})
+export class TaskListComponent implements OnInit {
+  protected readonly store = inject(TaskStore);
+
+  ngOnInit(): void {
+    this.store.load();
+  }
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="html" title="src/app/components/task-list/task-list.component.html">
+```html
+@if (store.isLoading()) {
+  <p class="status">Cargando tareas...</p>
+} @else {
+  <ul class="task-list">
+    @for (task of store.tasks(); track task.id) {
+      <app-task-item [task]="task" (toggled)="store.toggle($event)" (removed)="store.remove($event)" />
+    }
+  </ul>
+}
+```
+</CodeBlock>
+
+Y en la barra lateral, `TaskStatsComponent` inyecta el **mismo** store —porque está registrado con `providedIn: 'root'`, es un singleton a nivel de aplicación— sin ninguna relación de jerarquía con `TaskListComponent`:
+
+<CodeBlock lang="typescript" title="src/app/components/task-stats/task-stats.component.ts">
+```typescript
+import { Component, inject } from '@angular/core';
+import { TaskStore } from '../../state/task.store';
+
+@Component({
+  selector: 'app-task-stats',
+  standalone: true,
+  template: `
+    <p>{{ store.pendingCount() }} pendientes · {{ store.completedCount() }} completadas</p>
+  `,
+})
+export class TaskStatsComponent {
+  protected readonly store = inject(TaskStore);
+}
+```
+</CodeBlock>
+
+## ¿Cuándo NO usar un store global?
+
+Si el estado solo lo necesita un componente y sus hijos directos, un `signal` local (como en la parte 1) sigue siendo la opción correcta — un store en `providedIn: 'root'` para cada pedacito de estado local añade indirección sin beneficio. La señal de que necesitas un store compartido es concreta: **dos componentes sin relación de ancestro directo necesitan leer o modificar el mismo dato**.
+
+## Ejercicios
+
+1. Migra `AppComponent`, `TaskListComponent` y `TaskSearchComponent` para usar `TaskStore` en lugar de signals locales pasados por `@Input`/`@Output`.
+2. Añade un método `create(title: string)` al store, usando `rxMethod` igual que `load`.
+3. Añade un `computed` llamado `filteredTasks` al store que dependa de un nuevo campo de estado `searchTerm`, y conecta `TaskSearchComponent` para escribir en ese campo con `patchState`.
+4. Reemplaza el `pendingCount` calculado con una función normal (como en la parte 1) por la versión `computed` del store, y explica con tus palabras la diferencia de rendimiento entre ambas si `tasks` tiene 10.000 elementos.
+5. Investiga `withHooks` de `@ngrx/signals` y úsalo para llamar `store.load()` automáticamente cuando el store se inicializa, en lugar de hacerlo manualmente en `ngOnInit`.
+
+## Checklist de salida
+
+- [ ] Puedes explicar por qué `completionRate` del ejemplo no necesita ser un `signal` separado.
+- [ ] Sabes en qué se diferencia `linkedSignal` de `computed` y de `signal`.
+- [ ] `TaskStore` centraliza el estado de tareas y es consumido por al menos dos componentes sin relación padre-hijo.
+- [ ] Puedes explicar por qué `patchState` es la única forma de mutar el estado del store, en lugar de exponer setters directos.
+- [ ] Sabes justificar cuándo *no* conviene un store global frente a un signal local.
+
+En la parte 8 vas a llevar Taskboard a tiempo real: SignalR en el backend para notificar cambios sin que el cliente tenga que hacer polling, y el cliente de SignalR en Angular conectado directamente al `TaskStore` que acabas de construir.

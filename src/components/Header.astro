@@ -1,0 +1,41 @@
+<header class="sticky top-0 z-30 border-b border-ink/10 bg-paper/90 backdrop-blur-xl">
+  <div class="mx-auto flex h-18 max-w-[1500px] items-center justify-between gap-4 px-5 sm:px-8">
+    <a href="/" class="group flex items-center gap-3" aria-label="Inicio .NET Angular Open">
+      <span class="grid size-9 place-items-center rounded-xl bg-ink text-lg text-mint shadow-soft transition-transform group-hover:-rotate-6">◈</span>
+      <span class="hidden font-display text-lg font-bold tracking-tight sm:block">.NET Angular <span class="text-coral">Open</span></span>
+    </a>
+    <div class="flex items-center gap-2">
+      <button id="search-toggle" type="button" class="inline-flex items-center gap-2 rounded-full border border-ink/15 px-3 py-2 text-sm font-semibold text-ink/70 transition hover:border-ink/40 hover:text-ink" aria-label="Buscar lecciones">
+        <span aria-hidden="true">⌕</span><span class="hidden sm:inline">Buscar</span><kbd class="hidden rounded bg-ink/5 px-1.5 py-0.5 font-mono text-[10px] sm:inline">/</kbd>
+      </button>
+      <button id="theme-toggle" type="button" class="grid size-10 place-items-center rounded-full border border-ink/15 text-base transition hover:border-ink/40" aria-label="Cambiar tema"><span id="theme-icon">☼</span></button>
+    </div>
+  </div>
+  <div id="search-panel" class="hidden border-t border-ink/10 bg-paper">
+    <div class="mx-auto max-w-[1500px] px-5 py-4 sm:px-8">
+      <label for="lesson-search" class="sr-only">Buscar una lección</label>
+      <input id="lesson-search" class="w-full rounded-2xl border border-ink/15 bg-white px-4 py-3 outline-none ring-coral/30 placeholder:text-ink/40 focus:ring-4" placeholder="Busca por tema, módulo o tecnología..." />
+      <p class="mt-2 text-xs text-ink/50">Prueba con: Angular, Docker, JWT, testing</p>
+    </div>
+  </div>
+</header>
+<script>
+  const root = document.documentElement;
+  const themeToggle = document.querySelector('#theme-toggle');
+  const themeIcon = document.querySelector('#theme-icon');
+  const searchToggle = document.querySelector('#search-toggle');
+  const searchPanel = document.querySelector('#search-panel');
+  const searchInput = document.querySelector<HTMLInputElement>('#lesson-search');
+  const savedTheme = localStorage.getItem('theme');
+  if (savedTheme === 'dark') root.classList.add('dark');
+  const syncIcon = () => { if (themeIcon) themeIcon.textContent = root.classList.contains('dark') ? '☾' : '☼'; };
+  syncIcon();
+  themeToggle?.addEventListener('click', () => {
+    root.classList.toggle('dark');
+    localStorage.setItem('theme', root.classList.contains('dark') ? 'dark' : 'light');
+    syncIcon();
+  });
+  const openSearch = () => { searchPanel?.classList.remove('hidden'); searchInput?.focus(); };
+  searchToggle?.addEventListener('click', () => searchPanel?.classList.toggle('hidden'));
+  document.addEventListener('keydown', (event) => { if (event.key === '/' && document.activeElement?.tagName !== 'INPUT') { event.preventDefault(); openSearch(); } if (event.key === 'Escape') searchPanel?.classList.add('hidden'); });
+</script>

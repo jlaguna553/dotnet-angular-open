@@ -1,0 +1,31 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/Header.astro';
+const cards = [
+  ['00', 'Fundamentos web', 'La red como sistema: HTTP, rendering y APIs.', 'parte-0-fundamentos'],
+  ['00.5', 'Quickstart CRUD', 'Construye una app completa antes de entrar en detalle.', 'parte-0-5-quickstart-crud'],
+  ['01', 'Angular moderno', 'Standalone Components, control flow y Signals.', 'parte-1-angular-moderno'],
+];
+---
+<BaseLayout title="Aprende .NET y Angular">
+  <Header />
+  <main>
+    <section class="mx-auto grid max-w-[1500px] gap-12 px-5 pb-20 pt-16 sm:px-8 lg:grid-cols-[1.15fr_0.85fr] lg:items-end lg:pb-28 lg:pt-24">
+      <div>
+        <p class="mb-6 flex items-center gap-3 text-xs font-bold uppercase tracking-[0.2em] text-coral"><span class="size-2 rounded-full bg-coral"></span>Curso abierto · Cohorte 2026</p>
+        <h1 class="max-w-4xl font-display text-5xl font-bold leading-[0.98] tracking-tight text-ink sm:text-7xl lg:text-8xl">Software que <span class="text-coral">llega</span> a producción.</h1>
+        <p class="mt-8 max-w-2xl text-lg leading-8 text-ink/65 sm:text-xl">Una inmersión práctica en .NET 8, ASP.NET Core, Angular 17+ y las decisiones que convierten código en producto.</p>
+        <div class="mt-9 flex flex-wrap gap-3"><a href="/docs/parte-0-5-quickstart-crud" class="rounded-full bg-ink px-5 py-3 text-sm font-bold text-white transition hover:-translate-y-0.5 hover:bg-coral">Empezar el quickstart →</a><a href="/docs/parte-0-fundamentos" class="rounded-full border border-ink/15 px-5 py-3 text-sm font-bold text-ink transition hover:border-ink/40">Ver la ruta</a></div>
+      </div>
+      <div class="relative min-h-[280px] overflow-hidden rounded-[2rem] bg-ink p-7 text-white shadow-soft sm:min-h-[350px]">
+        <div class="absolute -right-12 -top-16 size-64 rounded-full border-[28px] border-mint/80"></div><div class="absolute -bottom-20 -left-10 size-48 rounded-full border-[20px] border-coral"></div>
+        <div class="relative flex h-full flex-col justify-between"><span class="font-mono text-xs text-mint">stack.log / now</span><div><p class="font-mono text-sm text-white/55">deploying confidence...</p><p class="mt-2 font-display text-4xl font-bold">ready<span class="text-coral">_</span></p></div><div class="flex flex-wrap gap-2 text-xs font-semibold"><span class="rounded-full bg-white/10 px-3 py-1.5">C#</span><span class="rounded-full bg-white/10 px-3 py-1.5">Angular</span><span class="rounded-full bg-white/10 px-3 py-1.5">PostgreSQL</span></div></div>
+      </div>
+    </section>
+    <section class="border-y border-ink/10 bg-white/45"><div class="mx-auto grid max-w-[1500px] gap-8 px-5 py-10 sm:grid-cols-3 sm:px-8"><div><p class="font-display text-3xl font-bold">13</p><p class="mt-1 text-sm text-ink/55">partes progresivas</p></div><div><p class="font-display text-3xl font-bold">∞</p><p class="mt-1 text-sm text-ink/55">ejercicios para construir</p></div><div><p class="font-display text-3xl font-bold">1</p><p class="mt-1 text-sm text-ink/55">proyecto que crece contigo</p></div></div></section>
+    <section class="mx-auto max-w-[1500px] px-5 py-16 sm:px-8"><div class="mb-8 flex items-end justify-between gap-4"><div><p class="text-xs font-bold uppercase tracking-[0.2em] text-coral">El recorrido</p><h2 class="mt-3 font-display text-3xl font-bold sm:text-4xl">Empieza por hacer.</h2></div><span class="hidden font-mono text-xs text-ink/40 sm:block">00 → 12</span></div><div class="grid gap-4 md:grid-cols-3">{cards.map(([number, title, description, slug]) => <a href={`/docs/${slug}`} class="group rounded-3xl border border-ink/10 bg-white p-6 transition hover:-translate-y-1 hover:border-coral hover:shadow-soft"><div class="flex items-start justify-between"><span class="font-mono text-sm text-coral">{number}</span><span class="text-xl transition group-hover:translate-x-1">↗</span></div><h3 class="mt-12 font-display text-xl font-bold">{title}</h3><p class="mt-2 text-sm leading-6 text-ink/60">{description}</p></a>)}</div></section>
+  </main>
+</BaseLayout>
+<style is:global>
+  body { overflow-x: hidden; }
+</style>

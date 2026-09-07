@@ -1,0 +1,266 @@
+---
+title: "Entity Framework Core a fondo"
+description: "LINQ más allá del filtro básico, relaciones uno-a-muchos entre entidades, el ciclo de vida real de las migraciones, y cómo cambiar de SQLite a PostgreSQL sin tocar un solo endpoint."
+part: 4
+duration: "4–6 horas"
+tags:
+  - dotnet-8
+  - ef-core
+  - postgresql
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Hasta ahora `TaskItem` es una tabla aislada. En este capítulo le añades una relación real —cada tarea pertenece a un proyecto—, profundizas en LINQ para consultas que EF Core traduce a SQL eficiente, y migras la base de datos de SQLite (perfecta para desarrollo local) a PostgreSQL (una base de datos gestionada, apta para producción).
+
+## Añade una relación uno-a-muchos: `Project` → `TaskItem`
+
+<CodeBlock lang="csharp" title="Models/Project.cs">
+```csharp
+namespace Taskboard.Api.Models;
+
+public sealed class Project
+{
+    public int Id { get; set; }
+    public required string Name { get; set; }
+
+    public ICollection<TaskItem> Tasks { get; set; } = new List<TaskItem>();
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Models/TaskItem.cs (actualizado)">
+```csharp
+namespace Taskboard.Api.Models;
+
+public sealed class TaskItem
+{
+    public int Id { get; set; }
+    public required string Title { get; set; }
+    public bool IsCompleted { get; set; }
+    public DateTime CreatedAt { get; set; }
+
+    public int ProjectId { get; set; }
+    public Project Project { get; set; } = null!;
+}
+```
+</CodeBlock>
+
+`Project` es la navegación "de uno a muchos" (`ICollection<TaskItem>`); `ProjectId` es la clave foránea explícita en `TaskItem`, y `Project` es la navegación inversa. EF Core puede inferir esta relación por convención de nombres, pero declararla explícitamente en `OnModelCreating` documenta la intención y te da control sobre el comportamiento al borrar:
+
+<CodeBlock lang="csharp" title="Data/TaskDbContext.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.Data;
+
+public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options) : DbContext(options)
+{
+    public DbSet<TaskItem> Tasks => Set<TaskItem>();
+    public DbSet<Project> Projects => Set<Project>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<TaskItem>(entity =>
+        {
+            entity.Property(task => task.Title).HasMaxLength(160).IsRequired();
+            entity.Property(task => task.CreatedAt).HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+            entity.HasOne(task => task.Project)
+                .WithMany(project => project.Tasks)
+                .HasForeignKey(task => task.ProjectId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<Project>(entity =>
+        {
+            entity.Property(project => project.Name).HasMaxLength(120).IsRequired();
+        });
+    }
+}
+```
+</CodeBlock>
+
+`DeleteBehavior.Cascade` significa: si borras un `Project`, EF Core borra automáticamente todas sus `TaskItem` relacionadas. La alternativa, `DeleteBehavior.Restrict`, impediría borrar un proyecto que aún tiene tareas — la decisión correcta depende de tu dominio, no hay un valor por defecto universalmente correcto.
+
+## LINQ: de "filtrar una lista" a "diseñar una consulta"
+
+La clave para escribir LINQ eficiente contra EF Core es recordar que **no estás iterando una lista en memoria** — estás construyendo una expresión que EF Core traduce a SQL. Cada método que encadenas se convierte en una cláusula.
+
+<CodeBlock lang="csharp" title="Ejemplos de LINQ traducido a SQL">
+```csharp
+// Filtrar + ordenar + proyectar → SELECT ... WHERE ... ORDER BY ...
+var pendingTasks = await database.Tasks
+    .Where(task => !task.IsCompleted)
+    .OrderBy(task => task.CreatedAt)
+    .Select(task => new { task.Id, task.Title })
+    .ToListAsync();
+
+// Agrupar → SELECT ProjectId, COUNT(*) ... GROUP BY ProjectId
+var countByProject = await database.Tasks
+    .GroupBy(task => task.ProjectId)
+    .Select(group => new { ProjectId = group.Key, Count = group.Count() })
+    .ToListAsync();
+
+// Incluir la entidad relacionada → JOIN
+var tasksWithProject = await database.Tasks
+    .Include(task => task.Project)
+    .ToListAsync();
+
+// Consulta agregada sin traer filas → SELECT COUNT(*)
+var pendingCount = await database.Tasks.CountAsync(task => !task.IsCompleted);
+```
+</CodeBlock>
+
+`.Include(task => task.Project)` es explícito por diseño: EF Core **no** carga relaciones automáticamente (a diferencia de otros ORMs con *lazy loading* por defecto), para que el costo de un `JOIN` sea siempre una decisión visible en el código, no una sorpresa en producción.
+
+### El error más común: mezclar código de C# no traducible
+
+<CodeBlock lang="csharp" title="Esto falla en tiempo de ejecución">
+```csharp
+// MAL: FormatTitle() es un método de C#, EF Core no sabe traducirlo a SQL
+var titles = await database.Tasks
+    .Select(task => FormatTitle(task.Title))
+    .ToListAsync(); // InvalidOperationException: no se pudo traducir
+
+// BIEN: trae los datos primero, transforma después en memoria
+var titles = await database.Tasks
+    .Select(task => task.Title)
+    .ToListAsync();
+var formatted = titles.Select(FormatTitle).ToList();
+```
+</CodeBlock>
+
+La regla práctica: todo lo que va **antes** de `ToListAsync()` / `FirstOrDefaultAsync()` / `CountAsync()` debe poder expresarse en SQL. Todo lo que va **después** ya es una `List<T>` en memoria, donde puedes usar cualquier código C#.
+
+## Filtrado dinámico: construir la consulta condicionalmente
+
+Un caso frecuente: un endpoint de búsqueda donde varios filtros son opcionales.
+
+<CodeBlock lang="csharp" title="Filtro opcional por proyecto y estado">
+```csharp
+group.MapGet("/", async (
+    int? projectId,
+    bool? completed,
+    TaskDbContext database,
+    CancellationToken cancellationToken) =>
+{
+    IQueryable<TaskItem> query = database.Tasks.AsNoTracking();
+
+    if (projectId is not null)
+    {
+        query = query.Where(task => task.ProjectId == projectId);
+    }
+
+    if (completed is not null)
+    {
+        query = query.Where(task => task.IsCompleted == completed);
+    }
+
+    var tasks = await query
+        .OrderByDescending(task => task.CreatedAt)
+        .Select(task => new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt))
+        .ToListAsync(cancellationToken);
+
+    return TypedResults.Ok(tasks);
+});
+```
+</CodeBlock>
+
+Importante: `query` es un `IQueryable<T>`, no una lista. Cada `.Where()` adicional **compone** la expresión sin ejecutar nada contra la base de datos — la consulta real solo se dispara en el `ToListAsync()` final, con un único `SELECT` que incluye todos los filtros combinados.
+
+## El ciclo de vida real de una migración
+
+Una migración no es solo `dotnet ef migrations add` — es un artefacto versionado que debe revisarse como cualquier otro cambio de código.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet ef migrations add AddProjectToTask
+```
+</CodeBlock>
+
+Esto genera dos archivos en `Migrations/`: uno con el método `Up()` (aplicar el cambio) y `Down()` (revertirlo), y un snapshot del modelo completo. **Revisa siempre el `Up()` generado antes de aplicarlo** — EF Core infiere el SQL a partir de tus cambios en C#, pero renombrar una propiedad, por ejemplo, puede generar un `DropColumn` + `AddColumn` (perdiendo los datos existentes) en lugar de un `RenameColumn` (que los preserva), y solo tú sabes cuál era la intención real.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet ef database update        # aplica todas las migraciones pendientes
+dotnet ef database update 0      # revierte TODAS las migraciones (útil en desarrollo)
+dotnet ef migrations remove      # borra la última migración si aún no se aplicó
+dotnet ef migrations script      # genera el SQL puro, sin aplicarlo — para revisar o versionar
+```
+</CodeBlock>
+
+En producción, nunca corras `dotnet ef database update` manualmente contra la base de datos real. La migración debe ser un paso reproducible del pipeline de despliegue (`database.Database.MigrateAsync()` al arrancar, como ya hace `Program.cs`, o un job de CI/CD explícito) — así garantizas que el esquema de cada entorno coincide exactamente con el código desplegado.
+
+## Cambia de SQLite a PostgreSQL sin tocar los endpoints
+
+Esta es la prueba de que separar la entidad de EF del contrato de respuesta (parte 0.5) y encapsular el acceso a datos en `TaskDbContext` funcionó: cambiar de proveedor es un cambio de configuración, no de lógica de negocio.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet remove package Microsoft.EntityFrameworkCore.Sqlite
+dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL --version 8.*
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddDbContext<TaskDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Taskboard")));
+```
+</CodeBlock>
+
+<CodeBlock lang="json" title="appsettings.Development.json">
+```json
+{
+  "ConnectionStrings": {
+    "Taskboard": "Host=localhost;Port=5432;Database=taskboard;Username=postgres;Password=postgres"
+  }
+}
+```
+</CodeBlock>
+
+Levanta Postgres local con un contenedor (adelantándonos a la parte 12):
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+docker run --name taskboard-db -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=taskboard -p 5432:5432 -d postgres:16
+```
+</CodeBlock>
+
+Las migraciones existentes de SQLite **no son compatibles** con Postgres (cada proveedor genera SQL específico) — bórralas y regenera contra el nuevo proveedor:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+rm -rf Migrations
+dotnet ef migrations add InitialCreate
+dotnet ef database update
+```
+</CodeBlock>
+
+En producción, la cadena de conexión nunca debería vivir en `appsettings.json` — usa una variable de entorno, que ASP.NET Core mapea automáticamente por convención de nombre (`ConnectionStrings__Taskboard` sobrescribe `ConnectionStrings:Taskboard`):
+
+<CodeBlock lang="bash" title="Variable de entorno en producción">
+```bash
+export ConnectionStrings__Taskboard="Host=prod-db.internal;Database=taskboard;Username=app;Password=$DB_PASSWORD"
+```
+</CodeBlock>
+
+## Ejercicios
+
+1. Añade el modelo `Project`, la relación con `TaskItem`, y un endpoint `GET /api/projects/{id}/tasks` que use `.Include()`.
+2. Escribe una consulta LINQ que devuelva, para cada proyecto, el nombre y el número de tareas pendientes (`GroupBy` + `Select` proyectado).
+3. Añade filtrado dinámico opcional por texto en el título (`ILike` en Postgres, o `Contains` en SQLite) combinable con el filtro de `completed` del ejemplo.
+4. Genera una migración, ábrela, y explica en un comentario qué SQL generaría `Up()` y `Down()` antes de aplicarla.
+5. Migra el proyecto de SQLite a PostgreSQL siguiendo los pasos de este capítulo y confirma que el smoke test de la parte 0.5 sigue devolviendo los mismos códigos de estado.
+
+## Checklist de salida
+
+- [ ] `TaskItem` tiene una relación uno-a-muchos con `Project`, configurada explícitamente en `OnModelCreating`.
+- [ ] Puedes explicar por qué EF Core no traduce métodos arbitrarios de C# dentro de un `Select` o `Where`.
+- [ ] Sabes qué hace `.Include()` y por qué no se activa automáticamente.
+- [ ] Has revisado el `Up()`/`Down()` de al menos una migración generada, no solo la ejecutaste a ciegas.
+- [ ] La API corre contra PostgreSQL en lugar de SQLite, con la cadena de conexión fuera del código fuente.
+
+En la parte 5 vas a proteger estos endpoints con autenticación real: ASP.NET Identity, JWT, refresh tokens, y los guards e interceptors del lado de Angular que hacen cumplir esas reglas en el cliente.

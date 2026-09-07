@@ -1,0 +1,302 @@
+---
+title: "GraphQL: Hot Chocolate y Apollo Angular"
+description: "Expón el mismo dominio de tareas como un esquema GraphQL con Hot Chocolate, consúmelo desde Angular con Apollo, y entiende exactamente cuándo GraphQL resuelve un problema real frente a REST."
+part: 9
+duration: "4–5 horas"
+tags:
+  - graphql
+  - hot-chocolate
+  - apollo-angular
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Este capítulo no reemplaza el REST que construiste — lo complementa, para que puedas comparar ambos enfoques sobre el mismo dominio. GraphQL resuelve dos problemas concretos de REST: **over-fetching** (recibir campos que no necesitas) y **under-fetching** (necesitar varias peticiones encadenadas para armar una sola vista).
+
+## El problema concreto que GraphQL resuelve
+
+Imagina una vista que muestra, para cada proyecto, su nombre y el título de sus tres tareas más recientes. Con REST tal como lo construiste:
+
+```text
+GET /api/projects           → trae TODOS los campos de TODOS los proyectos
+GET /api/projects/1/tasks   → una petición por cada proyecto para sus tareas
+GET /api/projects/2/tasks
+GET /api/projects/3/tasks
+...
+```
+
+Con GraphQL, una sola petición describe exactamente esa forma de datos:
+
+```graphql
+query {
+  projects {
+    name
+    tasks(take: 3, orderBy: { createdAt: DESC }) {
+      title
+    }
+  }
+}
+```
+
+El servidor decide cómo resolver eso de forma eficiente (idealmente con una sola consulta o un batch), y el cliente recibe **exactamente** los campos pedidos — ni más, ni menos.
+
+## Instala Hot Chocolate
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet add package HotChocolate.AspNetCore --version 13.*
+dotnet add package HotChocolate.Data.EntityFramework --version 13.*
+```
+</CodeBlock>
+
+## Define los tipos GraphQL a partir de tu dominio existente
+
+Hot Chocolate infiere el esquema a partir de clases C# — no necesitas reescribir tus modelos, solo describir cómo se consultan:
+
+<CodeBlock lang="csharp" title="GraphQL/Types/TaskType.cs">
+```csharp
+namespace Taskboard.Api.GraphQL.Types;
+
+public sealed class TaskType : ObjectType<Taskboard.Api.Models.TaskItem>
+{
+    protected override void Configure(IObjectTypeDescriptor<Taskboard.Api.Models.TaskItem> descriptor)
+    {
+        descriptor.Field(task => task.Id).Type<NonNullType<IdType>>();
+        descriptor.Field(task => task.Title).Type<NonNullType<StringType>>();
+        descriptor.Field(task => task.IsCompleted);
+        descriptor.Field(task => task.CreatedAt);
+        descriptor.Field(task => task.Project).Type<ProjectType>();
+    }
+}
+```
+</CodeBlock>
+
+## El tipo de consulta raíz (`Query`)
+
+<CodeBlock lang="csharp" title="GraphQL/Query.cs">
+```csharp
+using HotChocolate;
+using HotChocolate.Data;
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Data;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.GraphQL;
+
+public sealed class Query
+{
+    [UseFiltering]
+    [UseSorting]
+    public IQueryable<TaskItem> GetTasks(TaskDbContext database) =>
+        database.Tasks.AsNoTracking();
+
+    [UseFiltering]
+    public IQueryable<Project> GetProjects(TaskDbContext database) =>
+        database.Projects.AsNoTracking();
+}
+```
+</CodeBlock>
+
+`[UseFiltering]` y `[UseSorting]` son middlewares de Hot Chocolate que traducen argumentos de la consulta GraphQL (`where`, `order`) directamente a `Where`/`OrderBy` de LINQ sobre el `IQueryable<T>` — el mismo mecanismo de composición diferida que viste en la parte 4, ahora expuesto de forma declarativa al cliente.
+
+## Mutaciones: la forma GraphQL de escribir datos
+
+<CodeBlock lang="csharp" title="GraphQL/Mutation.cs">
+```csharp
+using Taskboard.Api.Data;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.GraphQL;
+
+public sealed record CreateTaskInput(string Title, int ProjectId);
+public sealed record CreateTaskPayload(TaskItem Task);
+
+public sealed class Mutation
+{
+    public async Task<CreateTaskPayload> CreateTask(
+        CreateTaskInput input, TaskDbContext database, CancellationToken cancellationToken)
+    {
+        var task = new TaskItem
+        {
+            Title = input.Title.Trim(),
+            ProjectId = input.ProjectId,
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        database.Tasks.Add(task);
+        await database.SaveChangesAsync(cancellationToken);
+
+        return new CreateTaskPayload(task);
+    }
+}
+```
+</CodeBlock>
+
+El patrón `Input`/`Payload` (en vez de recibir y devolver la entidad directamente) es una convención GraphQL establecida: deja espacio para añadir campos a la respuesta —como un mensaje de error estructurado o metadatos— sin romper compatibilidad con clientes existentes.
+
+## Registra el esquema
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services
+    .AddGraphQLServer()
+    .AddQueryType<Query>()
+    .AddMutationType<Mutation>()
+    .AddType<Taskboard.Api.GraphQL.Types.TaskType>()
+    .AddFiltering()
+    .AddSorting();
+
+// ... app = builder.Build(); ...
+
+app.MapGraphQL("/graphql");
+```
+</CodeBlock>
+
+Con la API corriendo, `http://localhost:5000/graphql` sirve **Nitro** (el IDE interactivo de Hot Chocolate, heredero de Banana Cake Pop) — puedes explorar el esquema completo y ejecutar consultas sin escribir ningún cliente todavía.
+
+## El problema N+1, y por qué te va a pasar
+
+Si `Query.GetTasks` no usa `.Include(task => task.Project)` y el cliente pide `tasks { title project { name } }`, Hot Chocolate ejecuta **una consulta SQL por cada tarea** para resolver su proyecto — el clásico problema N+1, exactamente el mismo riesgo que ya viste con `.Include()` en la parte 4, pero ahora invisible porque el cliente decide la forma de la consulta, no tú.
+
+La solución es un `DataLoader`, que agrupa (batch) todas las resoluciones pendientes de un mismo tipo dentro de un ciclo de ejecución en una sola consulta:
+
+<CodeBlock lang="csharp" title="GraphQL/ProjectByIdDataLoader.cs">
+```csharp
+using GreenDonut;
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Data;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.GraphQL;
+
+public sealed class ProjectByIdDataLoader(
+    IBatchScheduler batchScheduler, TaskDbContext database)
+    : BatchDataLoader<int, Project>(batchScheduler)
+{
+    protected override async Task<IReadOnlyDictionary<int, Project>> LoadBatchAsync(
+        IReadOnlyList<int> keys, CancellationToken cancellationToken)
+    {
+        return await database.Projects
+            .Where(project => keys.Contains(project.Id))
+            .ToDictionaryAsync(project => project.Id, cancellationToken);
+    }
+}
+```
+</CodeBlock>
+
+En lugar de N consultas de "un proyecto a la vez", el `DataLoader` acumula todos los `ProjectId` pedidos durante la ejecución de la consulta y los resuelve con **un solo** `WHERE Id IN (...)`.
+
+## Apollo Angular: el cliente
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+npm install @apollo/client apollo-angular graphql
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="src/app/graphql/graphql.provider.ts">
+```typescript
+import { ApplicationConfig, inject, provideAppInitializer } from '@angular/core';
+import { InMemoryCache } from '@apollo/client/core';
+import { Apollo, APOLLO_OPTIONS } from 'apollo-angular';
+import { HttpLink } from 'apollo-angular/http';
+
+export function provideGraphQL(): ApplicationConfig['providers'] {
+  return [
+    {
+      provide: APOLLO_OPTIONS,
+      useFactory: (httpLink: HttpLink) => ({
+        cache: new InMemoryCache(),
+        link: httpLink.create({ uri: '/graphql' }),
+      }),
+      deps: [HttpLink],
+    },
+  ];
+}
+```
+</CodeBlock>
+
+Añádelo a los providers de `app.config.ts`, junto a `provideHttpClient(...)` de la parte 2.
+
+<CodeBlock lang="typescript" title="src/app/services/task-graphql.service.ts">
+```typescript
+import { Injectable, inject } from '@angular/core';
+import { Apollo, gql } from 'apollo-angular';
+import { map } from 'rxjs';
+
+const GET_TASKS = gql`
+  query GetTasks {
+    tasks {
+      id
+      title
+      isCompleted
+      createdAt
+      project {
+        name
+      }
+    }
+  }
+`;
+
+const CREATE_TASK = gql`
+  mutation CreateTask($input: CreateTaskInput!) {
+    createTask(input: $input) {
+      task {
+        id
+        title
+      }
+    }
+  }
+`;
+
+@Injectable({ providedIn: 'root' })
+export class TaskGraphQLService {
+  private readonly apollo = inject(Apollo);
+
+  tasks$ = this.apollo
+    .watchQuery<{ tasks: unknown[] }>({ query: GET_TASKS })
+    .valueChanges.pipe(map((result) => result.data.tasks));
+
+  createTask(title: string, projectId: number) {
+    return this.apollo.mutate({
+      mutation: CREATE_TASK,
+      variables: { input: { title, projectId } },
+      refetchQueries: [{ query: GET_TASKS }],
+    });
+  }
+}
+```
+</CodeBlock>
+
+`watchQuery` (en lugar de `query`) es la pieza distintiva de Apollo: mantiene la consulta **viva** y actualiza el `Observable` automáticamente si el caché normalizado de Apollo cambia — por ejemplo, después de una mutación relacionada. `refetchQueries` le dice explícitamente qué volver a consultar tras `createTask`, similar en espíritu a la invalidación de caché que hiciste con Redis en la parte 6, pero gestionada del lado del cliente.
+
+## REST vs. GraphQL: cuándo usar cada uno
+
+| Situación | Preferible |
+| --- | --- |
+| API pública, contrato estable, cacheable por HTTP/CDN | REST |
+| Múltiples clientes (web, móvil) con necesidades de datos muy distintas | GraphQL |
+| Vistas que combinan datos de varias entidades relacionadas | GraphQL |
+| Operaciones simples tipo CRUD, semántica de verbos HTTP clara | REST |
+| Necesitas caching HTTP estándar (`Cache-Control`, CDN) sin esfuerzo extra | REST |
+| El equipo de frontend itera rápido y no quiere depender de cambios de backend para cada vista nueva | GraphQL |
+
+En Taskboard, ambos coexisten deliberadamente en este capítulo — en un proyecto real, la decisión suele ser una u otra para un dominio dado, no ambas a la vez, salvo casos de migración gradual.
+
+## Ejercicios
+
+1. Implementa `Query`, `Mutation` y el `DataLoader` de este capítulo, y confirma en Nitro que una consulta anidada `tasks { title project { name } }` genera solo dos consultas SQL (una para tareas, una batch para proyectos), no N+1.
+2. Añade una mutación `completeTask(id: ID!): CreateTaskPayload` y consúmela desde Apollo Angular.
+3. Añade paginación con cursor (`[UsePaging]` de Hot Chocolate) al campo `tasks` y ajusta la consulta de Apollo para pedir `pageInfo { hasNextPage endCursor }`.
+4. Compara, con las DevTools de red, cuántos bytes viajan para la misma vista ("proyectos con sus 3 tareas más recientes") implementada con REST (varias peticiones) vs. GraphQL (una).
+5. Investiga qué es una *subscription* de GraphQL y cómo Hot Chocolate la implementa por debajo usando el mismo transporte WebSocket que estudiaste con SignalR en la parte 8.
+
+## Checklist de salida
+
+- [ ] El esquema GraphQL expone `tasks` y `projects` con filtrado y ordenamiento.
+- [ ] Existe una mutación `createTask` funcional, con el patrón Input/Payload.
+- [ ] Un `DataLoader` evita el problema N+1 al resolver `project` desde `task`.
+- [ ] Apollo Angular consume el esquema con `watchQuery` y refresca tras una mutación.
+- [ ] Puedes justificar, con un ejemplo concreto de Taskboard, cuándo elegirías GraphQL sobre REST y viceversa.
+
+En la parte 10 vas a reestructurar el backend completo con Clean Architecture: separar dominio, aplicación e infraestructura, e introducir CQRS con MediatR para que cada caso de uso sea una clase explícita y testeable en aislamiento.

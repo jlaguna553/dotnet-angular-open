@@ -1,0 +1,299 @@
+---
+title: "Testing: xUnit, Moq, WebApplicationFactory, Vitest y Playwright"
+description: "Tests unitarios de handlers con xUnit y Moq, tests de integración de la API completa con WebApplicationFactory, y la pirámide de testing del lado de Angular con Vitest y Playwright."
+part: 11
+duration: "5–6 horas"
+tags:
+  - testing
+  - xunit
+  - playwright
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+La arquitectura de la parte 10 no vale nada si no la aprovechas para testear. Este capítulo cubre los tres niveles de la pirámide de testing, en ambos lados de la aplicación: unitarios rápidos y aislados, de integración contra una API real, y end-to-end contra la aplicación completa corriendo en un navegador.
+
+## La pirámide, y por qué el orden importa
+
+```text
+        △  E2E (Playwright)         — pocos, lentos, prueban el sistema completo
+       ╱ ╲
+      ╱   ╲  Integración (WebApplicationFactory) — algunos, prueban capas conectadas
+     ╱     ╲
+    ╱───────╲ Unitarios (xUnit + Moq / Vitest) — muchos, rápidos, prueban una unidad aislada
+```
+
+Cuantos más tests unitarios tengas, más rápido es tu feedback loop y más fácil localizar exactamente qué se rompió. Los tests E2E son los más valiosos para confianza de extremo a extremo, pero los más caros de escribir, correr y mantener — por eso son los menos numerosos.
+
+## Unitarios: xUnit + Moq para un handler de MediatR
+
+Gracias a la separación de capas de la parte 10, `CreateTaskCommandHandler` depende solo de `ITaskRepository` — una interfaz. Eso significa que puedes testearlo con un doble de prueba, sin base de datos real.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet new xunit -n Taskboard.Application.Tests
+dotnet add Taskboard.Application.Tests reference Taskboard.Application
+dotnet add Taskboard.Application.Tests package Moq
+dotnet add Taskboard.Application.Tests package FluentAssertions
+dotnet sln add Taskboard.Application.Tests
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Taskboard.Application.Tests/CreateTaskCommandHandlerTests.cs">
+```csharp
+using FluentAssertions;
+using Moq;
+using Taskboard.Application;
+using Taskboard.Application.Tasks;
+using Taskboard.Domain;
+using Xunit;
+
+namespace Taskboard.Application.Tests;
+
+public sealed class CreateTaskCommandHandlerTests
+{
+    [Fact]
+    public async Task Handle_TituloValido_GuardaLaTareaYLaDevuelve()
+    {
+        var repository = new Mock<ITaskRepository>();
+        var handler = new CreateTaskCommandHandler(repository.Object);
+        var command = new CreateTaskCommand("Publicar la API");
+
+        var result = await handler.Handle(command, CancellationToken.None);
+
+        result.Title.Should().Be("Publicar la API");
+        result.IsCompleted.Should().BeFalse();
+        repository.Verify(repo => repo.AddAsync(
+            It.Is<TaskItem>(task => task.Title == "Publicar la API"),
+            It.IsAny<CancellationToken>()), Times.Once);
+        repository.Verify(repo => repo.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Handle_TituloVacio_LanzaExcepcionYNoGuardaNada()
+    {
+        var repository = new Mock<ITaskRepository>();
+        var handler = new CreateTaskCommandHandler(repository.Object);
+        var command = new CreateTaskCommand("   ");
+
+        var act = () => handler.Handle(command, CancellationToken.None);
+
+        await act.Should().ThrowAsync<ArgumentException>();
+        repository.Verify(repo => repo.AddAsync(
+            It.IsAny<TaskItem>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+}
+```
+</CodeBlock>
+
+`Mock<ITaskRepository>()` crea una implementación falsa que registra cada llamada. `repository.Verify(...)` confirma **comportamiento** (¿se llamó `AddAsync`? ¿cuántas veces?), mientras que `result.Should().Be(...)` (de FluentAssertions) confirma **estado**. Un buen test unitario suele necesitar ambos: que el resultado sea correcto, y que las colaboraciones con sus dependencias sean las esperadas — ni de más, ni de menos.
+
+Fíjate que el segundo test **no** verifica ningún mensaje de error específico — solo que se lanzó `ArgumentException` y que `AddAsync` nunca se llamó. Acoplar el test al texto exacto del mensaje lo haría frágil ante cambios de redacción que no afectan el comportamiento real.
+
+## Integración: `WebApplicationFactory` levanta la API completa en memoria
+
+Un test de integración no mockea nada del propio sistema — levanta la aplicación real (pipeline de middleware, DI, endpoints) contra una base de datos de prueba, y le hace peticiones HTTP reales.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet new xunit -n Taskboard.Api.Tests
+dotnet add Taskboard.Api.Tests reference Taskboard.Api
+dotnet add Taskboard.Api.Tests package Microsoft.AspNetCore.Mvc.Testing
+dotnet add Taskboard.Api.Tests package FluentAssertions
+dotnet sln add Taskboard.Api.Tests
+```
+</CodeBlock>
+
+<CodeBlock lang="csharp" title="Taskboard.Api.Tests/TaskboardApiFactory.cs">
+```csharp
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Taskboard.Infrastructure;
+
+namespace Taskboard.Api.Tests;
+
+public sealed class TaskboardApiFactory : WebApplicationFactory<Program>
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureServices(services =>
+        {
+            var descriptor = services.Single(d => d.ServiceType == typeof(DbContextOptions<TaskDbContext>));
+            services.Remove(descriptor);
+
+            services.AddDbContext<TaskDbContext>(options =>
+                options.UseInMemoryDatabase($"taskboard-tests-{Guid.NewGuid()}"));
+        });
+    }
+}
+```
+</CodeBlock>
+
+Esto reemplaza la configuración real de SQLite/PostgreSQL por una base de datos en memoria **única por ejecución** (`Guid.NewGuid()` en el nombre) — cada test empieza con datos limpios, sin depender de un servidor de base de datos real ni de limpiar tablas manualmente entre tests. Recuerda `public partial class Program { }` al final de `Program.cs` desde la parte 0.5: es exactamente lo que permite que `WebApplicationFactory<Program>` encuentre el entry point.
+
+<CodeBlock lang="csharp" title="Taskboard.Api.Tests/TaskEndpointsTests.cs">
+```csharp
+using System.Net;
+using System.Net.Http.Json;
+using FluentAssertions;
+using Xunit;
+
+namespace Taskboard.Api.Tests;
+
+public sealed class TaskEndpointsTests(TaskboardApiFactory factory) : IClassFixture<TaskboardApiFactory>
+{
+    [Fact]
+    public async Task PostTasks_TituloValido_Devuelve201ConLocation()
+    {
+        var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/api/tasks", new { title = "Escribir tests" });
+
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.Headers.Location.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task PostTasks_TituloVacio_Devuelve400()
+    {
+        var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/api/tasks", new { title = "" });
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task GetTasks_DespuesDeCrear_IncluyeLaTareaCreada()
+    {
+        var client = factory.CreateClient();
+        await client.PostAsJsonAsync("/api/tasks", new { title = "Tarea visible en el listado" });
+
+        var response = await client.GetAsync("/api/tasks");
+        var tasks = await response.Content.ReadFromJsonAsync<List<TaskResponseDto>>();
+
+        tasks.Should().ContainSingle(task => task.Title == "Tarea visible en el listado");
+    }
+
+    private sealed record TaskResponseDto(int Id, string Title, bool IsCompleted, DateTime CreatedAt);
+}
+```
+</CodeBlock>
+
+`IClassFixture<TaskboardApiFactory>` comparte **una sola instancia** de la fábrica entre todos los tests de la clase — levantarla es costoso, así que xUnit la reutiliza en lugar de reconstruir toda la aplicación en cada `[Fact]`. La base de datos en memoria sigue siendo compartida entre tests de la misma clase; si eso te preocupa (un test viendo datos de otro), la mitigación estándar es que cada test cree sus propios datos con títulos únicos, como hace `GetTasks_DespuesDeCrear...` arriba, en lugar de depender de un estado global limpio.
+
+## Frontend: Vitest para tests unitarios de componentes
+
+Angular 17+ soporta Vitest como alternativa a Karma/Jasmine — más rápido y con una API de aserciones más moderna.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+ng add @angular/build --skip-confirmation
+npm install --save-dev vitest @analogjs/vite-plugin-angular
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="src/app/components/task-item/task-item.component.spec.ts">
+```typescript
+import { render, screen } from '@testing-library/angular';
+import { fireEvent } from '@testing-library/dom';
+import { describe, expect, it, vi } from 'vitest';
+import { TaskItemComponent } from './task-item.component';
+import { Task } from '../../models/task';
+
+const sampleTask: Task = {
+  id: 1,
+  title: 'Escribir tests',
+  isCompleted: false,
+  createdAt: new Date().toISOString(),
+};
+
+describe('TaskItemComponent', () => {
+  it('muestra el título de la tarea', async () => {
+    await render(TaskItemComponent, { inputs: { task: sampleTask } });
+
+    expect(screen.getByText('Escribir tests')).toBeTruthy();
+  });
+
+  it('emite "toggled" con la tarea al hacer click en el título', async () => {
+    const onToggled = vi.fn();
+    await render(TaskItemComponent, {
+      inputs: { task: sampleTask },
+      on: { toggled: onToggled },
+    });
+
+    fireEvent.click(screen.getByText('Escribir tests'));
+
+    expect(onToggled).toHaveBeenCalledWith(sampleTask);
+  });
+});
+```
+</CodeBlock>
+
+Este es exactamente el beneficio que anticipamos en la parte 1: `TaskItemComponent` no conoce `HttpClient` ni ningún servicio — el test lo instancia con un `Task` de mentira y verifica su comportamiento observable (qué muestra, qué emite), sin mockear nada de infraestructura.
+
+## E2E: Playwright contra la aplicación real
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+npm init playwright@latest
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="e2e/create-task.spec.ts">
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('el usuario puede crear una tarea y verla persistir tras recargar', async ({ page }) => {
+  await page.goto('http://localhost:4200');
+
+  await page.getByPlaceholder('Ej. Publicar la API').fill('Tarea creada por Playwright');
+  await page.getByRole('button', { name: 'Añadir' }).click();
+
+  await expect(page.getByText('Tarea creada por Playwright')).toBeVisible();
+
+  await page.reload();
+
+  await expect(page.getByText('Tarea creada por Playwright')).toBeVisible();
+});
+
+test('el formulario rechaza un título vacío', async ({ page }) => {
+  await page.goto('http://localhost:4200');
+
+  await page.getByRole('button', { name: 'Añadir' }).click();
+
+  await expect(page.getByText(/el título es obligatorio/i)).toBeVisible();
+});
+```
+</CodeBlock>
+
+Este test necesita **tanto** la API como Angular corriendo — es el nivel de la pirámide que prueba el sistema real, incluyendo la persistencia en la base de datos, exactamente el mismo criterio de "recarga y confirma que sigue ahí" del checklist de la parte 0.5, ahora automatizado.
+
+## Qué testear en cada nivel — una guía práctica
+
+| Nivel | Qué probar | Qué NO probar ahí |
+| --- | --- | --- |
+| Unitario (handler) | Reglas de negocio, validaciones, transformación de datos | Que EF Core genere el SQL correcto |
+| Unitario (componente) | Qué renderiza, qué emite, según sus `@Input` | Llamadas HTTP reales |
+| Integración (API) | Que el pipeline completo produzca el código de estado y payload correctos | Casos borde de reglas de negocio ya cubiertos por unitarios |
+| E2E | Flujos críticos de usuario, de principio a fin | Cada combinación de validación de un formulario |
+
+## Ejercicios
+
+1. Escribe el test unitario faltante para `GetAllTasksQueryHandler`, verificando que delega correctamente en `ITaskRepository.GetAllAsync`.
+2. Añade un test de integración para `PATCH /api/tasks/{id}` que confirme un `404` cuando el id no existe.
+3. Escribe un test de Vitest para `TaskFormComponent` (parte 2) que confirme que el botón "Añadir" no emite `created` si el campo está vacío.
+4. Escribe un test E2E de Playwright que cree una tarea, la marque como completada, y confirme visualmente (con `toHaveClass` o similar) que aparece tachada.
+5. Investiga qué es *test doubles* (dummy, stub, spy, mock, fake) y clasifica los ejemplos de este capítulo según esa taxonomía — ¿`Mock<ITaskRepository>` es realmente un "mock" en sentido estricto, o un "stub" según cómo lo usaste?
+
+## Checklist de salida
+
+- [ ] `CreateTaskCommandHandler` tiene tests unitarios con `Mock<ITaskRepository>`, cubriendo el caso válido y el inválido.
+- [ ] `WebApplicationFactory` levanta la API completa contra una base de datos en memoria por ejecución de test.
+- [ ] Al menos un componente de Angular tiene un test unitario que no depende de `HttpClient`.
+- [ ] Existe al menos un test E2E de Playwright que cubre el flujo completo de crear una tarea.
+- [ ] Puedes explicar, para cada nivel de la pirámide, qué tipo de bug detecta que los otros niveles no detectarían igual de bien.
+
+En la parte 12, la última, vas a empaquetar todo lo construido en contenedores: un `Dockerfile` multi-stage para la API, otro para Angular servido con nginx, y un `docker-compose.yml` que levanta el sistema completo —API, Angular, PostgreSQL y Redis— con un solo comando.

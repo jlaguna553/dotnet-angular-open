@@ -1,0 +1,619 @@
+---
+title: "Quickstart CRUD: de cero a una app desplegable"
+description: "Construye un gestor de tareas completo con una API .NET 8 Minimal, SQLite y una interfaz Angular Standalone. El objetivo es entender el viaje completo de un dato."
+part: 0.5
+duration: "3–5 horas"
+tags:
+  - dotnet-8
+  - angular
+  - sqlite
+  - crud
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Este capítulo es una **vertical slice**: una pieza pequeña, pero completa, que atraviesa base de datos, servidor y navegador. Al terminar tendrás una aplicación de tareas donde puedes listar, crear, completar y eliminar registros.
+
+La app no intenta esconder la complejidad detrás de una plantilla. Cada decisión está a la vista para que puedas cambiarla después.
+
+## El resultado que vamos a construir
+
+La arquitectura será deliberadamente pequeña:
+
+```text
+browser (Angular 17+)
+        │ HTTP / JSON
+        ▼
+ASP.NET Core 8 Minimal API
+        │ EF Core
+        ▼
+SQLite (tasks.db)
+```
+
+El recurso principal es `TaskItem`:
+
+| Método | Ruta | Acción |
+| --- | --- | --- |
+| `GET` | `/api/tasks` | Devuelve tareas ordenadas por fecha |
+| `POST` | `/api/tasks` | Crea una tarea |
+| `PATCH` | `/api/tasks/{id}` | Cambia el estado completado |
+| `DELETE` | `/api/tasks/{id}` | Elimina una tarea |
+
+### Requisitos
+
+- .NET SDK 8 instalado (`dotnet --version`)
+- Node.js 20 LTS o superior
+- Angular CLI (`npm install -g @angular/cli`)
+- Un editor con soporte para C# y TypeScript
+
+No necesitas Docker ni una base de datos instalada: SQLite vive en un archivo local.
+
+## 1. Crea la solución
+
+Separa backend y frontend desde el primer día. Esto hace visibles los límites y permite desplegarlos de forma independiente.
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+mkdir taskboard && cd taskboard
+dotnet new sln -n Taskboard
+dotnet new web -n Taskboard.Api
+dotnet sln add Taskboard.Api/Taskboard.Api.csproj
+ng new taskboard-web --standalone --routing --style=scss --skip-git
+```
+</CodeBlock>
+
+Instala Entity Framework Core con el proveedor de SQLite y las herramientas de migración:
+
+<CodeBlock lang="bash" title="Taskboard.Api/">
+```bash
+cd Taskboard.Api
+dotnet add package Microsoft.EntityFrameworkCore.Sqlite --version 8.*
+dotnet add package Microsoft.EntityFrameworkCore.Design --version 8.*
+dotnet tool install --global dotnet-ef
+cd ..
+```
+</CodeBlock>
+
+La estructura inicial queda así:
+
+```text
+Taskboard/
+├── Taskboard.sln
+├── Taskboard.Api/
+│   ├── Program.cs
+│   └── Taskboard.Api.csproj
+└── taskboard-web/
+    └── src/app/
+```
+
+## 2. Modela el dominio
+
+Crea `Taskboard.Api/Models/TaskItem.cs`. El modelo representa datos persistidos, no el formulario de entrada. `CreatedAt` lo controla el servidor para que el cliente no pueda falsificarlo.
+
+<CodeBlock lang="csharp" title="Models/TaskItem.cs">
+```csharp
+namespace Taskboard.Api.Models;
+
+public sealed class TaskItem
+{
+    public int Id { get; set; }
+    public required string Title { get; set; }
+    public bool IsCompleted { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+</CodeBlock>
+
+Para evitar aceptar campos que no deberían llegar desde el navegador, define contratos explícitos en `Contracts/TaskContracts.cs`:
+
+<CodeBlock lang="csharp" title="Contracts/TaskContracts.cs">
+```csharp
+namespace Taskboard.Api.Contracts;
+
+public sealed record CreateTaskRequest(string Title);
+public sealed record UpdateTaskRequest(bool IsCompleted);
+public sealed record TaskResponse(
+    int Id,
+    string Title,
+    bool IsCompleted,
+    DateTime CreatedAt);
+```
+</CodeBlock>
+
+La respuesta pública no tiene por qué coincidir con la entidad de EF Core. Esa pequeña separación evita acoplar tu API a futuras decisiones de persistencia.
+
+## 3. Configura EF Core y SQLite
+
+Crea `Data/TaskDbContext.cs`:
+
+<CodeBlock lang="csharp" title="Data/TaskDbContext.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.Data;
+
+public sealed class TaskDbContext(DbContextOptions<TaskDbContext> options)
+    : DbContext(options)
+{
+    public DbSet<TaskItem> Tasks => Set<TaskItem>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<TaskItem>(entity =>
+        {
+            entity.Property(task => task.Title)
+                .HasMaxLength(160)
+                .IsRequired();
+
+            entity.Property(task => task.CreatedAt)
+                .HasDefaultValueSql("CURRENT_TIMESTAMP");
+        });
+    }
+}
+```
+</CodeBlock>
+
+En `appsettings.json`, configura la conexión con un archivo local. En producción sustituirás esta cadena por una variable de entorno.
+
+<CodeBlock lang="json" title="appsettings.json">
+```json
+{
+  "ConnectionStrings": {
+    "Taskboard": "Data Source=taskboard.db"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
+```
+</CodeBlock>
+
+## 4. Construye la API Minimal
+
+Reemplaza el contenido de `Program.cs`. La aplicación registra CORS para el servidor de desarrollo de Angular, crea la base de datos al arrancar y expone cuatro operaciones HTTP.
+
+<CodeBlock lang="csharp" title="Program.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Contracts;
+using Taskboard.Api.Data;
+using Taskboard.Api.Models;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDbContext<TaskDbContext>(options =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("Taskboard")));
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AngularDev", policy => policy
+        .WithOrigins("http://localhost:4200")
+        .AllowAnyHeader()
+        .AllowAnyMethod());
+});
+
+var app = builder.Build();
+
+app.UseCors("AngularDev");
+
+using (var scope = app.Services.CreateScope())
+{
+    var database = scope.ServiceProvider.GetRequiredService<TaskDbContext>();
+    await database.Database.MigrateAsync();
+}
+
+app.MapGet("/api/tasks", async (TaskDbContext database, CancellationToken cancellationToken) =>
+{
+    var tasks = await database.Tasks
+        .AsNoTracking()
+        .OrderByDescending(task => task.CreatedAt)
+        .Select(task => new TaskResponse(
+            task.Id,
+            task.Title,
+            task.IsCompleted,
+            task.CreatedAt))
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(tasks);
+});
+
+app.MapPost("/api/tasks", async (
+    CreateTaskRequest request,
+    TaskDbContext database,
+    CancellationToken cancellationToken) =>
+{
+    var title = request.Title.Trim();
+    if (title.Length is < 1 or > 160)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            [nameof(request.Title)] = ["Escribe entre 1 y 160 caracteres."]
+        });
+    }
+
+    var task = new TaskItem
+    {
+        Title = title,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    database.Tasks.Add(task);
+    await database.SaveChangesAsync(cancellationToken);
+
+    return Results.Created($"/api/tasks/{task.Id}", new TaskResponse(
+        task.Id, task.Title, task.IsCompleted, task.CreatedAt));
+});
+
+app.MapPatch("/api/tasks/{id:int}", async (
+    int id,
+    UpdateTaskRequest request,
+    TaskDbContext database,
+    CancellationToken cancellationToken) =>
+{
+    var task = await database.Tasks.FindAsync([id], cancellationToken);
+    if (task is null)
+    {
+        return Results.NotFound();
+    }
+
+    task.IsCompleted = request.IsCompleted;
+    await database.SaveChangesAsync(cancellationToken);
+    return Results.NoContent();
+});
+
+app.MapDelete("/api/tasks/{id:int}", async (
+    int id,
+    TaskDbContext database,
+    CancellationToken cancellationToken) =>
+{
+    var deleted = await database.Tasks
+        .Where(task => task.Id == id)
+        .ExecuteDeleteAsync(cancellationToken);
+
+    return deleted == 0 ? Results.NotFound() : Results.NoContent();
+});
+
+app.Run();
+
+public partial class Program { }
+```
+</CodeBlock>
+
+Hay tres detalles que vale la pena observar:
+
+1. `AsNoTracking()` hace explícito que el listado es de solo lectura.
+2. `Results.Created` devuelve el recurso creado y su URL en el encabezado `Location`.
+3. `public partial class Program` permite que los tests de integración encuentren el entry point.
+
+## 5. Crea la migración
+
+El modelo de C# todavía no es una tabla. Una migración convierte ese cambio en instrucciones reproducibles:
+
+<CodeBlock lang="bash" title="Taskboard.Api/">
+```bash
+dotnet ef migrations add InitialCreate
+dotnet ef database update
+dotnet run
+```
+</CodeBlock>
+
+Visita `http://localhost:5000/api/tasks`. La respuesta inicial será `[]`. Puedes probar una creación con curl:
+
+<CodeBlock lang="bash" title="Otra terminal">
+```bash
+curl -i -X POST http://localhost:5000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Conectar Angular con la API"}'
+```
+</CodeBlock>
+
+Guarda el puerto real que imprime .NET. Si la URL es `https://localhost:7123`, usarás esa dirección en el proxy del frontend.
+
+## 6. Configura Angular Standalone
+
+En `taskboard-web/src/app/models/task.ts`, declara el contrato que consume la UI:
+
+<CodeBlock lang="typescript" title="src/app/models/task.ts">
+```typescript
+export interface Task {
+  id: number;
+  title: string;
+  isCompleted: boolean;
+  createdAt: string;
+}
+
+export interface CreateTaskRequest {
+  title: string;
+}
+```
+</CodeBlock>
+
+Crea un proxy para que el navegador llame a `/api` sin problemas de CORS durante el desarrollo:
+
+<CodeBlock lang="json" title="proxy.conf.json">
+```json
+{
+  "/api": {
+    "target": "https://localhost:7123",
+    "secure": false,
+    "changeOrigin": true
+  }
+}
+```
+</CodeBlock>
+
+Actualiza el script `start` en `package.json` de Angular:
+
+<CodeBlock lang="json" title="taskboard-web/package.json">
+```json
+{
+  "scripts": {
+    "start": "ng serve --proxy-config proxy.conf.json"
+  }
+}
+```
+</CodeBlock>
+
+## 7. Encapsula el acceso HTTP
+
+El servicio es la única pieza que conoce las rutas de la API. Esa frontera hace que el componente pueda concentrarse en interacción y estado.
+
+<CodeBlock lang="typescript" title="src/app/services/task-api.service.ts">
+```typescript
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable } from 'rxjs';
+import { CreateTaskRequest, Task } from '../models/task';
+
+@Injectable({ providedIn: 'root' })
+export class TaskApiService {
+  private readonly http = inject(HttpClient);
+  private readonly resourceUrl = '/api/tasks';
+
+  getAll(): Observable<Task[]> {
+    return this.http.get<Task[]>(this.resourceUrl);
+  }
+
+  create(request: CreateTaskRequest): Observable<Task> {
+    return this.http.post<Task>(this.resourceUrl, request);
+  }
+
+  updateStatus(id: number, isCompleted: boolean): Observable<void> {
+    return this.http.patch<void>(`${this.resourceUrl}/${id}`, { isCompleted });
+  }
+
+  remove(id: number): Observable<void> {
+    return this.http.delete<void>(`${this.resourceUrl}/${id}`);
+  }
+}
+```
+</CodeBlock>
+
+Registra `HttpClient` en `src/app/app.config.ts`:
+
+<CodeBlock lang="typescript" title="src/app/app.config.ts">
+```typescript
+import { ApplicationConfig } from '@angular/core';
+import { provideHttpClient } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { routes } from './app.routes';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(routes),
+    provideHttpClient(),
+  ],
+};
+```
+</CodeBlock>
+
+## 8. Construye el componente
+
+Este componente usa APIs standalone y `@if`/`@for`, el control flow moderno de Angular. El formulario es nativo en este quickstart para mantener el foco en el flujo HTTP; en la parte 2 lo sustituiremos por Reactive Forms.
+
+<CodeBlock lang="typescript" title="src/app/app.component.ts">
+```typescript
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+import { Task } from './models/task';
+import { TaskApiService } from './services/task-api.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [FormsModule],
+  templateUrl: './app.component.html',
+  styleUrl: './app.component.scss',
+})
+export class AppComponent implements OnInit {
+  private readonly taskApi = inject(TaskApiService);
+
+  readonly tasks = signal<Task[]>([]);
+  readonly isLoading = signal(true);
+  readonly errorMessage = signal('');
+  newTitle = '';
+
+  ngOnInit(): void {
+    this.loadTasks();
+  }
+
+  loadTasks(): void {
+    this.isLoading.set(true);
+    this.taskApi.getAll().subscribe({
+      next: (tasks) => {
+        this.tasks.set(tasks);
+        this.isLoading.set(false);
+      },
+      error: () => {
+        this.errorMessage.set('No pudimos cargar las tareas. ¿Está encendida la API?');
+        this.isLoading.set(false);
+      },
+    });
+  }
+
+  addTask(): void {
+    const title = this.newTitle.trim();
+    if (!title) return;
+
+    this.taskApi.create({ title }).subscribe({
+      next: (task) => {
+        this.tasks.update((tasks) => [task, ...tasks]);
+        this.newTitle = '';
+      },
+      error: () => this.errorMessage.set('La tarea no pudo guardarse.'),
+    });
+  }
+
+  toggleTask(task: Task): void {
+    this.taskApi.updateStatus(task.id, !task.isCompleted).subscribe({
+      next: () => this.tasks.update((tasks) => tasks.map((item) =>
+        item.id === task.id ? { ...item, isCompleted: !item.isCompleted } : item)),
+      error: () => this.errorMessage.set('No pudimos actualizar la tarea.'),
+    });
+  }
+
+  removeTask(task: Task): void {
+    this.taskApi.remove(task.id).subscribe({
+      next: () => this.tasks.update((tasks) => tasks.filter((item) => item.id !== task.id)),
+      error: () => this.errorMessage.set('No pudimos eliminar la tarea.'),
+    });
+  }
+}
+```
+</CodeBlock>
+
+La plantilla queda pequeña porque el componente mantiene la lógica en métodos con nombres claros:
+
+<CodeBlock lang="html" title="src/app/app.component.html">
+```html
+<main class="shell">
+  <header class="hero">
+    <p class="eyebrow">TASKBOARD / QUICKSTART</p>
+    <h1>Menos pendientes.<br /><em>Más entregas.</em></h1>
+    <p>Una lista mínima para practicar el viaje completo de un dato.</p>
+  </header>
+
+  <form class="composer" (ngSubmit)="addTask()">
+    <label for="new-task">Nueva tarea</label>
+    <div class="composer-row">
+      <input id="new-task" name="title" [(ngModel)]="newTitle"
+        placeholder="Ej. Publicar la API" maxlength="160" />
+      <button type="submit">Añadir</button>
+    </div>
+  </form>
+
+  @if (errorMessage()) {
+    <p class="error" role="alert">{{ errorMessage() }}</p>
+  }
+
+  @if (isLoading()) {
+    <p class="status">Cargando tareas...</p>
+  } @else {
+    <ul class="task-list">
+      @for (task of tasks(); track task.id) {
+        <li [class.completed]="task.isCompleted">
+          <button type="button" class="task-title" (click)="toggleTask(task)">
+            <span class="checkbox" aria-hidden="true">{{ task.isCompleted ? '✓' : '' }}</span>
+            {{ task.title }}
+          </button>
+          <button type="button" class="delete" (click)="removeTask(task)" aria-label="Eliminar tarea">×</button>
+        </li>
+      } @empty {
+        <li class="empty">Todavía no hay tareas. Es un buen momento para crear la primera.</li>
+      }
+    </ul>
+  }
+</main>
+```
+</CodeBlock>
+
+Los estilos pueden ser tan simples como el resto de la app. Lo importante es que los estados estén representados: carga, error, lista vacía y tarea completada.
+
+## 9. Arranca los dos lados
+
+Usa dos terminales:
+
+<CodeBlock lang="bash" title="Terminal 1 · API">
+```bash
+cd Taskboard/Taskboard.Api
+dotnet run
+```
+</CodeBlock>
+
+<CodeBlock lang="bash" title="Terminal 2 · Angular">
+```bash
+cd Taskboard/taskboard-web
+npm start
+```
+</CodeBlock>
+
+Abre `http://localhost:4200`. Crea una tarea, recarga la página y confirma que sigue ahí. Ese paso demuestra que no estás trabajando contra un estado falso en memoria: el dato atravesó Angular, HTTP, .NET, EF Core y SQLite.
+
+## 10. Comprueba el contrato con curl
+
+Antes de depurar estilos, prueba el comportamiento en el límite de la aplicación:
+
+<CodeBlock lang="bash" title="Smoke test">
+```bash
+curl http://localhost:5000/api/tasks
+curl -i -X POST http://localhost:5000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Escribir el primer test"}'
+curl -i -X PATCH http://localhost:5000/api/tasks/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"isCompleted":true}'
+curl -i -X DELETE http://localhost:5000/api/tasks/1
+```
+</CodeBlock>
+
+Los códigos de estado que esperamos son:
+
+- `200 OK` para el listado.
+- `201 Created` para la creación.
+- `204 No Content` para actualizar y borrar.
+- `404 Not Found` si se intenta actualizar o borrar un id inexistente.
+- `400 Bad Request` o `422 Unprocessable Entity` para un título inválido, según cómo centralices la validación.
+
+## Decisiones que conviene llevarte
+
+### ¿Por qué Minimal API?
+
+Porque reduce el ruido accidental en una primera vertical slice. No significa que todos los sistemas deban tener endpoints en `Program.cs`; cuando crezca el dominio, puedes mover cada grupo a un método de extensión o a módulos separados sin cambiar el contrato HTTP.
+
+### ¿Por qué no devolver la entidad de EF?
+
+La entidad pertenece al modelo de persistencia. Un contrato de respuesta permite ocultar columnas, renombrar propiedades o componer datos sin crear una migración de base de datos por cada decisión de frontend.
+
+### ¿Por qué el proxy y no CORS abierto?
+
+El proxy resuelve el origen durante desarrollo. En producción el frontend y la API pueden vivir bajo el mismo dominio o puedes configurar una lista explícita de orígenes confiables. `AllowAnyOrigin()` sería cómodo, pero no es una política de seguridad.
+
+### ¿Qué falta para producción?
+
+Autenticación, validación centralizada, logging estructurado, health checks, migraciones ejecutadas como paso de despliegue, una base de datos gestionada y tests automáticos. No son adornos: son las piezas que convierten el quickstart en un servicio mantenible.
+
+## Ejercicios
+
+1. Añade `priority` con los valores `low`, `normal` y `high`. Actualiza el modelo, la migración, los contratos y el formulario.
+2. Implementa `GET /api/tasks?completed=false` usando un parámetro opcional y una expresión LINQ.
+3. Muestra un contador de tareas pendientes usando un `computed` de Angular.
+4. Deshabilita el botón "Añadir" mientras la petición está en curso y evita doble envío.
+5. Añade un endpoint `GET /api/health` que devuelva el estado de la aplicación y la base de datos.
+6. Escribe una prueba de integración para el caso "crear una tarea con título vacío".
+7. Cambia SQLite por PostgreSQL usando una variable `ConnectionStrings__Taskboard` sin tocar el código de los endpoints.
+
+## Checklist de salida
+
+- [ ] La API arranca sin excepciones.
+- [ ] La migración crea `taskboard.db`.
+- [ ] Angular carga tareas desde `GET /api/tasks`.
+- [ ] Crear, completar y eliminar persiste tras recargar.
+- [ ] La API rechaza títulos vacíos o demasiado largos.
+- [ ] El frontend muestra estados de carga, error y lista vacía.
+- [ ] El smoke test devuelve los códigos de estado esperados.
+
+Has construido un sistema pequeño, pero real. En la siguiente parte vamos a desmontar Angular pieza a pieza para entender por qué funciona y cómo llevarlo a una arquitectura de componentes que siga siendo legible cuando la aplicación crezca.

@@ -1,0 +1,190 @@
+---
+title: "Fundamentos: la red como sistema"
+description: "HTTP/1.1, HTTP/2 y HTTP/3, la diferencia real entre SPA y SSR, y los principios de una API REST bien diseñada. La teoría que sostiene todo lo que construirás después."
+part: 0
+duration: "2–3 horas"
+tags:
+  - http
+  - rest
+  - arquitectura
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Antes de escribir una sola línea de Angular o de C#, vale la pena entender qué pasa realmente cuando un navegador le pide algo a un servidor. Este capítulo es teoría con las manos en el teclado: cada concepto viene acompañado de un comando que lo hace visible.
+
+## El ciclo petición-respuesta
+
+Toda esta guía, sin importar cuántas capas le añadamos después, se reduce a esto:
+
+```text
+┌──────────┐   1. Request   ┌──────────┐
+│ Cliente  │ ─────────────► │ Servidor │
+│ (Angular)│ ◄───────────── │ (.NET)   │
+└──────────┘   2. Response  └──────────┘
+```
+
+Una petición HTTP tiene un método, una ruta, encabezados y, opcionalmente, un cuerpo. La respuesta tiene un código de estado, encabezados y, opcionalmente, un cuerpo. Todo lo demás —React, Angular, JSON, GraphQL— son convenciones que construimos encima de este intercambio.
+
+Inspecciónalo directamente con curl y el flag `-v` (verbose), que muestra los encabezados que normalmente el navegador oculta:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+curl -v https://api.github.com/zen
+```
+</CodeBlock>
+
+Vas a ver líneas que empiezan con `>` (lo que envía tu cliente) y `<` (lo que responde el servidor). Guarda ese hábito: cuando algo falle en producción, `curl -v` sigue siendo la herramienta más honesta que existe.
+
+## HTTP/1.1: el protocolo que todos aprendimos primero
+
+HTTP/1.1 (1997) introdujo las conexiones persistentes (`Keep-Alive`), pero tiene una limitación estructural: **head-of-line blocking**. Si abres una conexión y pides tres recursos en serie, el segundo espera a que termine el primero.
+
+```text
+Conexión 1: [-- request A --][-- response A --][-- request B --][-- response B --]
+```
+
+Los navegadores lo compensan abriendo varias conexiones TCP en paralelo (típicamente 6 por dominio), lo que explica prácticas antiguas como el "sharding de dominios" (`img1.example.com`, `img2.example.com`) para multiplicar ese límite.
+
+## HTTP/2: multiplexación sobre una sola conexión
+
+HTTP/2 (2015) resuelve el head-of-line blocking a nivel de aplicación multiplexando varios streams sobre **una sola conexión TCP**:
+
+```text
+Conexión única: [A1][B1][A2][B2][A3][B2]...  (streams intercalados, misma conexión)
+```
+
+Añade además:
+
+- **Compresión de encabezados (HPACK)**: los encabezados repetidos (cookies, user-agent) no viajan completos en cada petición.
+- **Server push** (hoy en desuso): el servidor podía enviar recursos que anticipaba que el cliente pediría.
+- Requiere TLS en la práctica, aunque el estándar no lo exige.
+
+Puedes comprobar qué protocolo usa un sitio con:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+curl -I --http2 -o /dev/null -w "protocol: %{http_version}\n" https://www.google.com
+```
+</CodeBlock>
+
+El head-of-line blocking no desaparece del todo: sigue existiendo a nivel de **TCP**. Si un paquete se pierde, TCP bloquea todos los streams multiplexados hasta retransmitirlo, aunque pertenezcan a recursos distintos.
+
+## HTTP/3: QUIC y el fin del bloqueo por TCP
+
+HTTP/3 (2022) cambia el transporte: en lugar de TCP usa **QUIC**, construido sobre UDP. Cada stream es independiente a nivel de transporte, así que la pérdida de un paquete solo bloquea su propio stream, no los demás.
+
+```text
+HTTP/2 sobre TCP:  paquete perdido → bloquea TODOS los streams
+HTTP/3 sobre QUIC: paquete perdido → bloquea SOLO su stream
+```
+
+QUIC también integra TLS 1.3 en el handshake inicial, reduciendo el número de "vueltas" (round-trips) necesarias para establecer una conexión segura, algo que se nota especialmente en redes móviles con latencia alta.
+
+Para lo que vas a construir en este curso esto es información de fondo: ASP.NET Core y Kestrel soportan HTTP/2 out of the box y HTTP/3 de forma experimental/estable según la versión, pero como desarrollador rara vez configuras el protocolo de transporte directamente — lo decide el servidor web (Kestrel, nginx, un balanceador) y la capacidad del cliente.
+
+## SPA vs. SSR vs. MPA: dónde vive el renderizado
+
+Esta es la decisión arquitectónica que más define un proyecto full stack.
+
+### Multi-Page Application (MPA) clásica
+
+Cada navegación es una petición nueva al servidor, que devuelve HTML completo:
+
+```text
+Click en enlace → petición HTML completa → el navegador descarta la página anterior y pinta la nueva
+```
+
+Simple, pero cada interacción reinicia el estado de la página (scroll, animaciones, formularios sin guardar).
+
+### Single Page Application (SPA) — lo que construirás en este curso
+
+El servidor sirve **una vez** un HTML mínimo y un bundle de JavaScript. Angular toma el control del DOM y las siguientes "navegaciones" son manejadas en el cliente, pidiendo solo **datos** (JSON) al servidor, no HTML:
+
+```text
+Carga inicial:  GET /  → HTML + bundle.js (una vez)
+Navegación:     Angular Router cambia la vista sin recargar
+Datos:          GET /api/tasks → JSON (varias veces, según interacción)
+```
+
+Ventajas: interacciones instantáneas, estado de UI persistente entre "páginas", separación clara entre backend (datos) y frontend (presentación) — lo que permite desplegarlos y escalarlos por separado, como harás desde la parte 0.5.
+
+Costo: el primer render depende de descargar y ejecutar JavaScript antes de mostrar contenido útil (peor *time-to-first-byte* percibido), y por defecto el contenido no es visible para crawlers que no ejecutan JS.
+
+### Server-Side Rendering (SSR)
+
+Un término medio: el servidor ejecuta el framework de frontend (Angular Universal, Next.js) para generar el HTML de la primera carga, y luego el cliente "hidrata" esa página para que las siguientes interacciones se comporten como una SPA. Angular lo soporta vía `@angular/ssr`, pero queda fuera del alcance de este curso — construirás una SPA pura consumida por una API .NET independiente, el patrón más común en aplicaciones internas y dashboards.
+
+## Arquitectura REST: los principios, no solo la sintaxis
+
+REST (*Representational State Transfer*) no es "una API que usa JSON sobre HTTP" — es un conjunto de restricciones arquitectónicas propuestas por Roy Fielding en el año 2000. Las que más importan en la práctica:
+
+### 1. Cliente-servidor
+
+Angular y la API .NET no comparten proceso ni memoria. Se comunican exclusivamente por HTTP. Esto es lo que te permite versionar, escalar y desplegar cada uno de forma independiente — el motivo por el que en la parte 0.5 creaste dos proyectos separados desde el primer commit.
+
+### 2. Sin estado (stateless)
+
+Cada petición debe contener toda la información necesaria para procesarla. El servidor no guarda "sesión" del cliente entre peticiones. Cuando en la parte 5 añadamos autenticación, esto es exactamente por qué usaremos JWT en lugar de sesiones en memoria: el token viaja en cada petición y el servidor no necesita recordar nada entre una y otra.
+
+### 3. Recursos identificados por URL, manipulados con verbos HTTP
+
+Un recurso es un sustantivo (`/api/tasks`, `/api/tasks/7`), no un verbo (`/api/getTasks`, `/api/deleteTask?id=7`). La acción la define el método HTTP:
+
+| Verbo | Semántica | Idempotente | Seguro |
+| --- | --- | --- | --- |
+| `GET` | Leer, sin efectos secundarios | Sí | Sí |
+| `POST` | Crear un recurso nuevo | No | No |
+| `PUT` | Reemplazar el recurso completo | Sí | No |
+| `PATCH` | Modificar parcialmente | No* | No |
+| `DELETE` | Eliminar | Sí | No |
+
+*Idempotente* significa que repetir la misma petición varias veces produce el mismo resultado que hacerla una sola vez. `DELETE /api/tasks/7` es idempotente: bórralo una vez o diez, el resultado final es el mismo (no existe). `POST /api/tasks` no lo es: cada llamada crea una tarea nueva.
+
+### 4. Interfaz uniforme y códigos de estado con significado
+
+El código de estado no es un detalle cosmético — es el contrato:
+
+- `2xx`: la operación se completó como se esperaba.
+- `3xx`: hay que seguir una redirección.
+- `4xx`: el **cliente** cometió un error (dato inválido, recurso inexistente, no autenticado).
+- `5xx`: el **servidor** falló procesando una petición válida.
+
+Un endpoint que devuelve `200 OK` con `{ "error": "not found" }` en el cuerpo rompe el contrato: obliga al cliente a inspeccionar el cuerpo para saber si algo salió mal, en lugar de confiar en el código de estado. En la parte 0.5 ya viste esto en práctica: `Results.NotFound()` devuelve `404`, no un `200` con un mensaje.
+
+### 5. Cacheable
+
+Las respuestas deben declarar explícita o implícitamente si pueden cachearse. `GET /api/tasks` podría llevar un encabezado `Cache-Control`, mientras que una respuesta de `POST` nunca debería cachearse. Volveremos a esto en la parte 6 cuando hablemos de cachear en el servidor con Redis.
+
+## Observa el contrato real de tu API
+
+Con la API del quickstart corriendo (`dotnet run` dentro de `Taskboard.Api`), inspecciona los encabezados de una respuesta real:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+curl -i http://localhost:5000/api/tasks
+```
+</CodeBlock>
+
+Fíjate en:
+
+- El código de estado en la primera línea (`HTTP/1.1 200 OK`).
+- `Content-Type: application/json; charset=utf-8` — le dice al cliente cómo interpretar el cuerpo.
+- La ausencia de un encabezado `Set-Cookie` — no hay estado de sesión en el servidor.
+
+## Ejercicios
+
+1. Ejecuta `curl -v` contra tres sitios distintos y anota qué versión de HTTP negoció cada uno (`curl -I --http2` para forzar HTTP/2, y observa el campo `%{http_version}` con `-w`).
+2. Abre las DevTools del navegador en cualquier SPA conocida, ve a la pestaña Network, y clasifica las peticiones en "carga del bundle" vs. "peticiones de datos". ¿Cuántas peticiones de datos ocurren antes de que el usuario interactúe con algo?
+3. Para cada endpoint del quickstart de la parte 0.5, escribe qué código de estado esperarías si: (a) el recurso no existe, (b) el cuerpo de la petición es inválido, (c) todo sale bien. Compara tu respuesta con el código real usando curl.
+4. Explica con tus propias palabras por qué `PUT /api/tasks/7` con el mismo cuerpo dos veces seguidas es idempotente, pero `POST /api/tasks` con el mismo cuerpo dos veces no lo es.
+5. Investiga qué es el "problema de las cascadas de peticiones" (*request waterfalls*) en una SPA y por qué HTTP/2 solo lo mitiga parcialmente (la solución real es de diseño de la aplicación, no del protocolo).
+
+## Checklist de salida
+
+- [ ] Puedes explicar la diferencia entre HTTP/1.1, HTTP/2 y HTTP/3 sin mencionar únicamente "es más rápido".
+- [ ] Puedes explicar por qué una SPA hace su primera carga más lenta pero las navegaciones posteriores más rápidas que una MPA.
+- [ ] Sabes justificar, con al menos dos principios REST, por qué una API se diseña alrededor de recursos y no de acciones.
+- [ ] Has usado `curl -v` o `curl -i` para inspeccionar una respuesta HTTP real.
+
+Con esta base, la parte 0.5 (si aún no la hiciste) te lleva a construir la primera vertical slice. Desde la parte 1 en adelante, vamos a profundizar cada pieza de esa arquitectura: Angular primero, luego .NET, y finalmente las piezas de un sistema en producción.

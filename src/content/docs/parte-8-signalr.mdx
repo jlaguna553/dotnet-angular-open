@@ -1,0 +1,273 @@
+---
+title: "Tiempo real con SignalR"
+description: "Un Hub de ASP.NET Core que notifica cambios a todos los clientes conectados, el cliente de SignalR en Angular conectado al TaskStore, y por qué WebSockets resuelve algo que HTTP puro no puede."
+part: 8
+duration: "3–4 horas"
+tags:
+  - signalr
+  - websockets
+  - dotnet-8
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+Hasta ahora, si dos personas tienen Taskboard abierto en pestañas distintas, una no se entera de lo que hace la otra hasta que recarga la página. Este capítulo resuelve eso con SignalR: cuando alguien crea o completa una tarea, **todos los demás clientes conectados** lo ven al instante, sin hacer polling.
+
+## Por qué HTTP puro no alcanza para esto
+
+HTTP es fundamentalmente petición-respuesta: el cliente pregunta, el servidor responde, la conexión termina (o queda inactiva hasta la siguiente petición). El servidor **no puede iniciar** una comunicación hacia el cliente — no tiene forma de "avisar" que algo cambió si el cliente no pregunta primero.
+
+```text
+HTTP tradicional:
+  Cliente: "¿hay cambios?"  →  Servidor: "no"
+  Cliente: "¿hay cambios?"  →  Servidor: "no"      (polling: ineficiente, con latencia)
+  Cliente: "¿hay cambios?"  →  Servidor: "sí, aquí están"
+
+WebSocket (lo que usa SignalR):
+  Cliente ⇄ Servidor         (conexión persistente, full-duplex)
+  Servidor: "¡cambió algo!"  →  Cliente recibe sin preguntar
+```
+
+SignalR es una librería de ASP.NET Core que abstrae WebSockets (y hace *fallback* automático a Server-Sent Events o long polling si el entorno no los soporta), dándote una API de "llamar métodos remotos" en ambas direcciones en lugar de gestionar frames de WebSocket a mano.
+
+## El Hub: el punto de encuentro de todos los clientes
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet add package Microsoft.AspNetCore.SignalR --version 8.*
+```
+</CodeBlock>
+
+Un `Hub` es una clase que SignalR expone como punto de conexión. Los métodos que definas pueden ser invocados por los clientes; y desde el servidor, usas `Clients` para llamar métodos **en** los clientes conectados:
+
+<CodeBlock lang="csharp" title="Hubs/TaskHub.cs">
+```csharp
+using Microsoft.AspNetCore.SignalR;
+using Taskboard.Api.Contracts;
+
+namespace Taskboard.Api.Hubs;
+
+public sealed class TaskHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        await Groups.AddToGroupAsync(Context.ConnectionId, "taskboard-viewers");
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, "taskboard-viewers");
+        await base.OnDisconnectedAsync(exception);
+    }
+}
+```
+</CodeBlock>
+
+No necesitas métodos invocables desde el cliente en este caso — Taskboard solo necesita que el servidor **empuje** eventos. El grupo `"taskboard-viewers"` es una simplificación deliberada: todos los clientes reciben todos los eventos. En una aplicación real con múltiples equipos o espacios de trabajo, usarías grupos por `projectId` para que cada cliente solo reciba eventos relevantes.
+
+## Un servicio para emitir eventos desde los endpoints
+
+En lugar de inyectar `IHubContext<TaskHub>` directamente en cada endpoint, encapsúlalo — el mismo principio de la parte 0.5 de no dejar que los detalles de infraestructura se filtren por todo el código:
+
+<CodeBlock lang="csharp" title="Hubs/TaskNotifier.cs">
+```csharp
+using Microsoft.AspNetCore.SignalR;
+using Taskboard.Api.Contracts;
+
+namespace Taskboard.Api.Hubs;
+
+public sealed class TaskNotifier(IHubContext<TaskHub> hubContext)
+{
+    public Task NotifyCreatedAsync(TaskResponse task) =>
+        hubContext.Clients.Group("taskboard-viewers").SendAsync("taskCreated", task);
+
+    public Task NotifyUpdatedAsync(TaskResponse task) =>
+        hubContext.Clients.Group("taskboard-viewers").SendAsync("taskUpdated", task);
+
+    public Task NotifyDeletedAsync(int taskId) =>
+        hubContext.Clients.Group("taskboard-viewers").SendAsync("taskDeleted", taskId);
+}
+```
+</CodeBlock>
+
+`SendAsync("taskCreated", task)` invoca un método llamado `taskCreated` en **todos** los clientes del grupo. Ese nombre de método es un contrato informal entre backend y frontend — no hay tipado compartido automático como en gRPC, así que debe documentarse (o generarse, como verás en la parte 9 con GraphQL).
+
+## Conecta el notificador a los endpoints existentes
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs (Create actualizado)">
+```csharp
+private static async Task<Results<Created<TaskResponse>, ValidationProblem>> Create(
+    CreateTaskRequest request, TaskDbContext database, TaskCacheService cacheService,
+    TaskNotifier notifier, CancellationToken cancellationToken)
+{
+    // ... validación y creación (parte 3), invalidación de caché (parte 6) ...
+
+    var response = new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt);
+    await notifier.NotifyCreatedAsync(response);
+
+    return TypedResults.Created($"/api/tasks/{task.Id}", response);
+}
+```
+</CodeBlock>
+
+Registra el Hub en `Program.cs`:
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddSignalR();
+builder.Services.AddScoped<TaskNotifier>();
+
+// ... app = builder.Build(); ...
+
+app.MapHub<TaskHub>("/hubs/tasks");
+```
+</CodeBlock>
+
+CORS necesita un ajuste: SignalR con WebSockets requiere `AllowCredentials()`, lo que a su vez exige reemplazar `AllowAnyOrigin` (si lo tuvieras) por orígenes explícitos — ya lo tenías así desde la parte 0.5, así que solo añades el método:
+
+<CodeBlock lang="csharp" title="Program.cs (política de CORS actualizada)">
+```csharp
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AngularDev", policy => policy
+        .WithOrigins("http://localhost:4200")
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        .AllowCredentials());
+});
+```
+</CodeBlock>
+
+## Cliente de SignalR en Angular
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+npm install @microsoft/signalr
+```
+</CodeBlock>
+
+<CodeBlock lang="typescript" title="src/app/services/task-realtime.service.ts">
+```typescript
+import { Injectable, inject } from '@angular/core';
+import { HubConnection, HubConnectionBuilder, LogLevel } from '@microsoft/signalr';
+import { Task } from '../models/task';
+import { TaskStore } from '../state/task.store';
+import { patchState } from '@ngrx/signals';
+
+@Injectable({ providedIn: 'root' })
+export class TaskRealtimeService {
+  private readonly store = inject(TaskStore);
+  private connection?: HubConnection;
+
+  connect(): void {
+    this.connection = new HubConnectionBuilder()
+      .withUrl('/hubs/tasks')
+      .withAutomaticReconnect()
+      .configureLogging(LogLevel.Warning)
+      .build();
+
+    this.connection.on('taskCreated', (task: Task) => {
+      patchState(this.store, { tasks: [task, ...this.store.tasks()] });
+    });
+
+    this.connection.on('taskUpdated', (task: Task) => {
+      patchState(this.store, {
+        tasks: this.store.tasks().map((item) => (item.id === task.id ? task : item)),
+      });
+    });
+
+    this.connection.on('taskDeleted', (taskId: number) => {
+      patchState(this.store, {
+        tasks: this.store.tasks().filter((item) => item.id !== taskId),
+      });
+    });
+
+    this.connection.start().catch((error) => console.error('No se pudo conectar a SignalR', error));
+  }
+
+  disconnect(): void {
+    void this.connection?.stop();
+  }
+}
+```
+</CodeBlock>
+
+`withAutomaticReconnect()` es la razón por la que no necesitas manejar manualmente caídas de red temporales — SignalR reintenta la conexión con backoff exponencial por defecto. `this.connection.on(...)` registra los mismos nombres de método (`taskCreated`, `taskUpdated`, `taskDeleted`) que el backend invoca desde `TaskNotifier`.
+
+Añade el proxy de `/hubs` al `proxy.conf.json` de la parte 0.5, junto a `/api`:
+
+<CodeBlock lang="json" title="proxy.conf.json">
+```json
+{
+  "/api": {
+    "target": "https://localhost:7123",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/hubs": {
+    "target": "https://localhost:7123",
+    "secure": false,
+    "changeOrigin": true,
+    "ws": true
+  }
+}
+```
+</CodeBlock>
+
+`"ws": true` es imprescindible — sin él, el proxy de desarrollo de Angular no reenvía el *upgrade* de HTTP a WebSocket, y la conexión de SignalR haría fallback silencioso a long polling.
+
+## Conéctate al arrancar la aplicación
+
+<CodeBlock lang="typescript" title="src/app/app.component.ts (fragmento)">
+```typescript
+export class AppComponent implements OnInit, OnDestroy {
+  private readonly realtime = inject(TaskRealtimeService);
+
+  ngOnInit(): void {
+    this.realtime.connect();
+  }
+
+  ngOnDestroy(): void {
+    this.realtime.disconnect();
+  }
+}
+```
+</CodeBlock>
+
+## El problema que esto introduce: duplicar el propio cambio
+
+Cuando el propio cliente crea una tarea, recibe **dos** notificaciones del mismo cambio: la respuesta HTTP de `POST /api/tasks` (que ya actualiza el store en `TaskStore.create`, ejercicio de la parte 7) y el evento `taskCreated` de SignalR que le llega a todos, incluido él mismo. Si ambos insertan la tarea en `tasks`, terminas con un duplicado.
+
+La solución más simple: que el store verifique si el `id` ya existe antes de insertar.
+
+<CodeBlock lang="typescript" title="src/app/state/task.store.ts (fragmento defensivo)">
+```typescript
+function upsertTask(tasks: Task[], incoming: Task): Task[] {
+  const exists = tasks.some((task) => task.id === incoming.id);
+  return exists
+    ? tasks.map((task) => (task.id === incoming.id ? incoming : task))
+    : [incoming, ...tasks];
+}
+```
+</CodeBlock>
+
+Este es un ejemplo real de un problema que solo aparece cuando dos canales de actualización (HTTP y WebSocket) conviven — vale la pena que lo veas ahora, en una app pequeña, antes de encontrarlo por primera vez en producción.
+
+## Ejercicios
+
+1. Implementa el Hub, el notificador y la conexión de Angular tal como en este capítulo, y confirma en dos pestañas del navegador que crear una tarea en una se refleja en la otra sin recargar.
+2. Añade la función `upsertTask` y úsala en los tres manejadores (`taskCreated`, `taskUpdated`, `taskDeleted`) del servicio de tiempo real.
+3. Cambia el grupo `"taskboard-viewers"` por grupos por `projectId` (`Groups.AddToGroupAsync(Context.ConnectionId, $"project-{projectId}")`), de forma que solo los clientes viendo un proyecto reciban sus eventos.
+4. Añade un indicador visual (un punto verde/rojo) que muestre si la conexión de SignalR está activa, usando los eventos `onreconnecting` y `onreconnected` de `HubConnection`.
+5. Investiga qué es un *backplane* de Redis para SignalR (`AddStackExchangeRedis` en `AddSignalR()`) y por qué es obligatorio en cuanto despliegas más de una instancia de la API — conecta esto con lo que aprendiste sobre pub/sub en la parte 6.
+
+## Checklist de salida
+
+- [ ] El Hub de SignalR está mapeado en `/hubs/tasks` y acepta conexiones.
+- [ ] Crear, actualizar o eliminar una tarea en una pestaña se refleja en tiempo real en otra pestaña.
+- [ ] El proxy de desarrollo de Angular tiene `"ws": true` configurado para `/hubs`.
+- [ ] Manejaste el caso de duplicación cuando el propio cliente origina el cambio.
+- [ ] Puedes explicar, con tus palabras, por qué HTTP puro no permite que el servidor inicie comunicación hacia el cliente.
+
+En la parte 9 vas a explorar una forma distinta de exponer datos: GraphQL con Hot Chocolate en el backend y Apollo Angular en el cliente, y vas a comparar explícitamente cuándo conviene sobre el REST que construiste hasta ahora.

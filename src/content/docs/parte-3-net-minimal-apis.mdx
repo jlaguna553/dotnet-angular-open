@@ -1,0 +1,303 @@
+---
+title: ".NET Minimal APIs a fondo"
+description: "Organiza endpoints en grupos de rutas, entiende el pipeline de middleware en el orden correcto, documenta la API con Swagger/OpenAPI y centraliza el manejo de errores con ProblemDetails."
+part: 3
+duration: "4–5 horas"
+tags:
+  - dotnet-8
+  - minimal-apis
+  - middleware
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+En la parte 0.5, `Program.cs` acumuló cuatro endpoints directamente en el cuerpo del archivo. Funciona para una vertical slice, pero no escala: en este capítulo vas a organizarlos en un grupo de rutas, entender qué es realmente el pipeline de middleware, añadir Swagger, y reemplazar el manejo de errores disperso por un mecanismo centralizado.
+
+## El pipeline de middleware: una tubería, en orden
+
+Cada petición HTTP que llega a Kestrel atraviesa una cadena de componentes — el *middleware pipeline*. Cada middleware decide si pasa la petición al siguiente (`await next()`), corta la cadena ahí mismo (por ejemplo, devolviendo un `401`), o hace algo antes y después de que el resto de la cadena se ejecute:
+
+```text
+Request  →  [CORS] → [Auth] → [Endpoint] → Response
+                                    │
+                          (la respuesta viaja de vuelta
+                           por el mismo camino, en orden inverso)
+```
+
+El **orden en que registras middleware importa**, y es una de las fuentes de bugs más comunes en ASP.NET Core. Si registras autenticación después de mapear los endpoints, por ejemplo, nunca llegará a ejecutarse para ellos. Un middleware personalizado se ve así:
+
+<CodeBlock lang="csharp" title="Middleware/RequestTimingMiddleware.cs">
+```csharp
+namespace Taskboard.Api.Middleware;
+
+public sealed class RequestTimingMiddleware(RequestDelegate next, ILogger<RequestTimingMiddleware> logger)
+{
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        await next(context);
+
+        stopwatch.Stop();
+        logger.LogInformation(
+            "{Method} {Path} → {StatusCode} en {ElapsedMs}ms",
+            context.Request.Method,
+            context.Request.Path,
+            context.Response.StatusCode,
+            stopwatch.ElapsedMilliseconds);
+    }
+}
+```
+</CodeBlock>
+
+Regístralo con `app.UseMiddleware<T>()`, **antes** de los middleware cuyo tiempo quieras medir (incluido el propio enrutamiento a los endpoints):
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+var app = builder.Build();
+
+app.UseMiddleware<RequestTimingMiddleware>();
+app.UseCors("AngularDev");
+
+// ... resto del pipeline
+```
+</CodeBlock>
+
+## Agrupa rutas con `MapGroup`
+
+`MapGroup` (disponible desde .NET 7) te da un prefijo de ruta compartido y un punto único donde aplicar metadatos —tags de Swagger, autenticación, filtros— a todo un conjunto de endpoints relacionados, sin repetirlo en cada `Map*`:
+
+<CodeBlock lang="csharp" title="Endpoints/TaskEndpoints.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Contracts;
+using Taskboard.Api.Data;
+using Taskboard.Api.Models;
+
+namespace Taskboard.Api.Endpoints;
+
+public static class TaskEndpoints
+{
+    public static RouteGroupBuilder MapTaskEndpoints(this IEndpointRouteBuilder routes)
+    {
+        var group = routes.MapGroup("/api/tasks").WithTags("Tasks");
+
+        group.MapGet("/", GetAll);
+        group.MapPost("/", Create);
+        group.MapPatch("/{id:int}", UpdateStatus);
+        group.MapDelete("/{id:int}", Remove);
+
+        return group;
+    }
+
+    private static async Task<Ok<List<TaskResponse>>> GetAll(
+        TaskDbContext database, CancellationToken cancellationToken)
+    {
+        var tasks = await database.Tasks
+            .AsNoTracking()
+            .OrderByDescending(task => task.CreatedAt)
+            .Select(task => new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt))
+            .ToListAsync(cancellationToken);
+
+        return TypedResults.Ok(tasks);
+    }
+
+    private static async Task<Results<Created<TaskResponse>, ValidationProblem>> Create(
+        CreateTaskRequest request, TaskDbContext database, CancellationToken cancellationToken)
+    {
+        var title = request.Title.Trim();
+        if (title.Length is < 1 or > 160)
+        {
+            return TypedResults.ValidationProblem(new Dictionary<string, string[]>
+            {
+                [nameof(request.Title)] = ["Escribe entre 1 y 160 caracteres."],
+            });
+        }
+
+        var task = new TaskItem { Title = title, CreatedAt = DateTime.UtcNow };
+        database.Tasks.Add(task);
+        await database.SaveChangesAsync(cancellationToken);
+
+        var response = new TaskResponse(task.Id, task.Title, task.IsCompleted, task.CreatedAt);
+        return TypedResults.Created($"/api/tasks/{task.Id}", response);
+    }
+
+    private static async Task<Results<NoContent, NotFound>> UpdateStatus(
+        int id, UpdateTaskRequest request, TaskDbContext database, CancellationToken cancellationToken)
+    {
+        var task = await database.Tasks.FindAsync([id], cancellationToken);
+        if (task is null) return TypedResults.NotFound();
+
+        task.IsCompleted = request.IsCompleted;
+        await database.SaveChangesAsync(cancellationToken);
+        return TypedResults.NoContent();
+    }
+
+    private static async Task<Results<NoContent, NotFound>> Remove(
+        int id, TaskDbContext database, CancellationToken cancellationToken)
+    {
+        var deleted = await database.Tasks.Where(task => task.Id == id).ExecuteDeleteAsync(cancellationToken);
+        return deleted == 0 ? TypedResults.NotFound() : TypedResults.NoContent();
+    }
+}
+```
+</CodeBlock>
+
+`Program.cs` queda reducido a configuración e infraestructura — el mapeo de rutas es una sola línea:
+
+<CodeBlock lang="csharp" title="Program.cs">
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Taskboard.Api.Data;
+using Taskboard.Api.Endpoints;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDbContext<TaskDbContext>(options =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("Taskboard")));
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AngularDev", policy => policy
+        .WithOrigins("http://localhost:4200")
+        .AllowAnyHeader()
+        .AllowAnyMethod());
+});
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseCors("AngularDev");
+app.UseExceptionHandler();
+
+using (var scope = app.Services.CreateScope())
+{
+    var database = scope.ServiceProvider.GetRequiredService<TaskDbContext>();
+    await database.Database.MigrateAsync();
+}
+
+app.MapTaskEndpoints();
+
+app.Run();
+
+public partial class Program { }
+```
+</CodeBlock>
+
+Los tipos `Ok<T>`, `Created<T>`, `NoContent`, `NotFound` y `ValidationProblem`, junto con el helper `TypedResults`, vienen de `Microsoft.AspNetCore.Http.HttpResults` y están disponibles automáticamente. La ventaja frente a devolver `IResult` (lo que hacía `Results.Ok(...)` en la parte 0.5) es que **el tipo de retorno documenta en la firma del método qué códigos de estado son posibles** — Swagger los lee directamente de ahí, sin anotaciones adicionales.
+
+## Documenta con Swagger / OpenAPI
+
+Con `AddEndpointsApiExplorer()` y `AddSwaggerGen()` registrados, y `UseSwagger()` + `UseSwaggerUI()` activos en desarrollo, visita:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+dotnet run
+# abre http://localhost:5000/swagger
+```
+</CodeBlock>
+
+Vas a ver los cuatro endpoints agrupados bajo el tag "Tasks" (por el `WithTags` que aplicamos al grupo), con los esquemas de `CreateTaskRequest`, `UpdateTaskRequest` y `TaskResponse` generados automáticamente a partir de los tipos C#. Puedes enriquecer cada endpoint con metadatos adicionales:
+
+<CodeBlock lang="csharp" title="Ejemplo de metadatos por endpoint">
+```csharp
+group.MapPost("/", Create)
+    .WithSummary("Crea una nueva tarea")
+    .WithDescription("El título se recorta de espacios y debe tener entre 1 y 160 caracteres.")
+    .Produces<TaskResponse>(StatusCodes.Status201Created)
+    .ProducesValidationProblem();
+```
+</CodeBlock>
+
+Esto no es solo cosmético: un frontend en Angular puede generar un cliente TypeScript tipado directamente desde este documento OpenAPI (herramientas como `openapi-typescript` lo hacen), eliminando la necesidad de mantener `Task` e `CreateTaskRequest` sincronizados a mano entre los dos proyectos.
+
+## Manejo de errores centralizado con `IExceptionHandler`
+
+Hasta ahora, cada endpoint maneja sus propios casos de error explícitamente (`if (task is null) return NotFound()`). Eso está bien para errores de negocio esperables. Pero, ¿qué pasa con una excepción no controlada — una conexión a la base de datos que se cae a mitad de una consulta? Sin manejo centralizado, ASP.NET Core devuelve una página de error HTML en desarrollo, o un `500` desnudo en producción, sin un formato consistente.
+
+.NET 8 introdujo la interfaz `IExceptionHandler`:
+
+<CodeBlock lang="csharp" title="ErrorHandling/GlobalExceptionHandler.cs">
+```csharp
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+
+namespace Taskboard.Api.ErrorHandling;
+
+public sealed class GlobalExceptionHandler(
+    ILogger<GlobalExceptionHandler> logger,
+    IHostEnvironment environment) : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(
+        HttpContext httpContext,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        logger.LogError(exception, "Excepción no controlada procesando {Path}", httpContext.Request.Path);
+
+        var problemDetails = new ProblemDetails
+        {
+            Status = StatusCodes.Status500InternalServerError,
+            Title = "Ocurrió un error inesperado.",
+            Detail = environment.IsDevelopment() ? exception.Message : null,
+            Instance = httpContext.Request.Path,
+        };
+
+        httpContext.Response.StatusCode = problemDetails.Status.Value;
+        await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken);
+
+        return true; // true = "ya manejé esta excepción, no la vuelvas a propagar"
+    }
+}
+```
+</CodeBlock>
+
+Regístralo en `Program.cs`, antes de `app.Build()`:
+
+<CodeBlock lang="csharp" title="Program.cs (fragmento)">
+```csharp
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+builder.Services.AddProblemDetails();
+```
+</CodeBlock>
+
+`ProblemDetails` (RFC 7807) es el formato estándar que ya estabas usando implícitamente con `Results.ValidationProblem()` en la parte 0.5 — este handler garantiza que **cualquier** excepción no controlada, no solo los errores de validación explícitos, termine en el mismo formato JSON consistente:
+
+<CodeBlock lang="json" title="Respuesta de ejemplo — 500">
+```json
+{
+  "status": 500,
+  "title": "Ocurrió un error inesperado.",
+  "detail": "No se pudo conectar a la base de datos.",
+  "instance": "/api/tasks"
+}
+```
+</CodeBlock>
+
+`detail` solo se rellena en desarrollo (`environment.IsDevelopment()`) — exponer el mensaje interno de una excepción en producción es una fuga de información: puede revelar rutas de archivos, nombres de tablas o versiones de librerías a un atacante.
+
+## Ejercicios
+
+1. Mueve los endpoints de tareas a `TaskEndpoints.cs` como en este capítulo y confirma que Swagger sigue mostrando los cuatro endpoints correctamente agrupados.
+2. Añade `.WithSummary()` y `.Produces<T>()` a los cuatro endpoints y verifica en `/swagger` que los ejemplos de respuesta cambian.
+3. Provoca una excepción no controlada a propósito (por ejemplo, apaga la base de datos o lanza una excepción manualmente en `GetAll`) y confirma que `GlobalExceptionHandler` la captura con el formato `ProblemDetails` esperado.
+4. Escribe un middleware personalizado que rechace con `400` cualquier petición `POST`/`PATCH` cuyo `Content-Type` no sea `application/json`.
+5. Investiga la diferencia entre `app.Use(...)` (middleware inline) y `app.UseMiddleware<T>()` (middleware como clase) — ¿cuándo usarías cada uno?
+
+## Checklist de salida
+
+- [ ] Los endpoints de tareas viven en `TaskEndpoints.cs`, agrupados con `MapGroup`.
+- [ ] `Program.cs` solo contiene configuración de servicios y el pipeline, sin lógica de negocio.
+- [ ] Swagger UI muestra los cuatro endpoints con tags, resúmenes y esquemas de respuesta.
+- [ ] Un `IExceptionHandler` centralizado captura excepciones no controladas y responde con `ProblemDetails`.
+- [ ] Puedes explicar, con tus palabras, por qué el orden de registro de middleware importa.
+
+Con la API mejor organizada, en la parte 4 vas a profundizar en Entity Framework Core: LINQ más allá de lo básico, relaciones entre entidades, el ciclo de vida de las migraciones, y cómo migrar de SQLite a PostgreSQL o SQL Server sin tocar los endpoints.

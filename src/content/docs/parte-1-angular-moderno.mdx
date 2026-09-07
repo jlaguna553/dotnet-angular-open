@@ -1,0 +1,342 @@
+---
+title: "Angular moderno: Standalone Components y Signals"
+description: "Desmonta el componente único del quickstart en piezas standalone, aprende el control flow con @if y @for, domina data binding en los dos sentidos, y da tus primeros pasos con Signals."
+part: 1
+duration: "4–6 horas"
+tags:
+  - angular
+  - standalone-components
+  - signals
+---
+
+import CodeBlock from '../../components/CodeBlock.astro';
+
+En la parte 0.5 construiste `AppComponent` como un monolito: cargaba datos, guardaba estado y renderizaba la lista entera. Funciona, pero no escala — cada nueva funcionalidad haría ese archivo más grande e imposible de testear en aislamiento.
+
+En este capítulo vas a dividir Taskboard en componentes standalone con responsabilidades claras, y a entender las dos herramientas que Angular moderno usa para todo: el **control flow** (`@if`, `@for`) y los **Signals**.
+
+## Por qué "standalone" cambió Angular
+
+Hasta Angular 13, todo componente pertenecía a un `NgModule`. Declarar un componente nuevo significaba declararlo *y* añadirlo a la lista `declarations` de un módulo, y el módulo declaraba qué otros módulos importaba. Standalone Components (estable desde Angular 15, por defecto desde Angular 17) elimina esa capa: un componente declara sus propias dependencias directamente.
+
+```typescript
+@Component({
+  selector: 'app-task-item',
+  standalone: true,          // ya es el valor por defecto en Angular 17+, pero es explícito
+  imports: [DatePipe],       // sin NgModule intermedio
+  templateUrl: './task-item.component.html',
+})
+export class TaskItemComponent {}
+```
+
+Esto tiene una consecuencia práctica inmediata: **`ng new` ya no genera módulos**, y cada componente es un límite de dependencias explícito y auditable con solo mirar su `imports`.
+
+## Divide el monolito: la anatomía de Taskboard
+
+Vamos a pasar de un componente a cuatro, cada uno con una única razón para cambiar:
+
+```text
+AppComponent               (orquesta: carga datos, maneja errores globales)
+ ├── TaskFormComponent      (emite un evento cuando el usuario quiere crear una tarea)
+ └── TaskListComponent      (recibe tareas, las renderiza)
+      └── TaskItemComponent (una fila: mostrar, marcar completada, eliminar)
+```
+
+### El modelo no cambia
+
+Sigue siendo el mismo contrato de la parte 0.5:
+
+<CodeBlock lang="typescript" title="src/app/models/task.ts">
+```typescript
+export interface Task {
+  id: number;
+  title: string;
+  isCompleted: boolean;
+  createdAt: string;
+}
+
+export interface CreateTaskRequest {
+  title: string;
+}
+```
+</CodeBlock>
+
+## Data binding: los cuatro caminos que tiene un dato
+
+Antes del código, vale la pena nombrar explícitamente los cuatro mecanismos que vas a usar, porque Angular los distingue por sintaxis:
+
+| Sintaxis | Dirección | Ejemplo |
+| --- | --- | --- |
+| `{{ valor }}` | Componente → plantilla (interpolación) | `{{ task.title }}` |
+| `[propiedad]="expresion"` | Componente → elemento/componente hijo (property binding) | `[class.completed]="task.isCompleted"` |
+| `(evento)="metodo()"` | Elemento/componente hijo → componente (event binding) | `(click)="toggle()"` |
+| `[(ngModel)]="propiedad"` | Ambas direcciones (banana-in-a-box) | `[(ngModel)]="newTitle"` |
+
+Un componente standalone hijo expone su propia superficie con dos decoradores: `@Input()` para recibir datos (equivalente a un property binding desde el padre) y `@Output()` para emitir eventos (equivalente a un event binding hacia el padre).
+
+## `TaskItemComponent`: input, output y property binding
+
+Este componente no sabe nada de HTTP. Solo recibe una tarea y avisa cuando el usuario quiere actuar sobre ella — esa ignorancia deliberada es lo que lo hace fácil de testear y reutilizar.
+
+<CodeBlock lang="typescript" title="src/app/components/task-item/task-item.component.ts">
+```typescript
+import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { Task } from '../../models/task';
+
+@Component({
+  selector: 'app-task-item',
+  standalone: true,
+  templateUrl: './task-item.component.html',
+})
+export class TaskItemComponent {
+  @Input({ required: true }) task!: Task;
+  @Output() toggled = new EventEmitter<Task>();
+  @Output() removed = new EventEmitter<Task>();
+}
+```
+</CodeBlock>
+
+`@Input({ required: true })` es una adición de Angular 16: si el padre olvida pasar `[task]`, obtienes un error de compilación en lugar de un `undefined` en tiempo de ejecución.
+
+<CodeBlock lang="html" title="src/app/components/task-item/task-item.component.html">
+```html
+<li [class.completed]="task.isCompleted">
+  <button type="button" class="task-title" (click)="toggled.emit(task)">
+    <span class="checkbox" aria-hidden="true">{{ task.isCompleted ? '✓' : '' }}</span>
+    {{ task.title }}
+  </button>
+  <button type="button" class="delete" (click)="removed.emit(task)" aria-label="Eliminar tarea">×</button>
+</li>
+```
+</CodeBlock>
+
+## `TaskListComponent`: el control flow moderno con `@for`
+
+Antes de Angular 17, iterar una lista requería la directiva estructural `*ngFor` (y, con ella, importar `CommonModule`). El nuevo control flow es sintaxis del propio motor de plantillas — no requiere ningún import — y obliga a declarar la clave de seguimiento (`track`) explícitamente, en lugar de dejarla opcional como con `trackBy`:
+
+<CodeBlock lang="typescript" title="src/app/components/task-list/task-list.component.ts">
+```typescript
+import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { Task } from '../../models/task';
+import { TaskItemComponent } from '../task-item/task-item.component';
+
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskItemComponent],
+  templateUrl: './task-list.component.html',
+})
+export class TaskListComponent {
+  @Input({ required: true }) tasks: Task[] = [];
+  @Input() isLoading = false;
+  @Output() toggled = new EventEmitter<Task>();
+  @Output() removed = new EventEmitter<Task>();
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="html" title="src/app/components/task-list/task-list.component.html">
+```html
+@if (isLoading) {
+  <p class="status">Cargando tareas...</p>
+} @else if (tasks.length === 0) {
+  <p class="empty">Todavía no hay tareas. Es un buen momento para crear la primera.</p>
+} @else {
+  <ul class="task-list">
+    @for (task of tasks; track task.id) {
+      <app-task-item
+        [task]="task"
+        (toggled)="toggled.emit($event)"
+        (removed)="removed.emit($event)"
+      />
+    }
+  </ul>
+}
+```
+</CodeBlock>
+
+`track task.id` le dice a Angular cómo identificar cada fila entre renders. Sin una clave estable, Angular tendría que destruir y recrear el DOM de la lista completa cada vez que cambia una sola tarea — con `track task.id`, solo actualiza (o mueve) el elemento que realmente cambió.
+
+`@if / @else if / @else` reemplaza a `*ngIf` con la misma ventaja: es sintaxis nativa, no una directiva que haya que importar, y soporta ramas múltiples sin anidar `ng-template`.
+
+## `TaskFormComponent`: banana-in-a-box con `[(ngModel)]`
+
+<CodeBlock lang="typescript" title="src/app/components/task-form/task-form.component.ts">
+```typescript
+import { Component, EventEmitter, Output } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+
+@Component({
+  selector: 'app-task-form',
+  standalone: true,
+  imports: [FormsModule],
+  templateUrl: './task-form.component.html',
+})
+export class TaskFormComponent {
+  @Output() created = new EventEmitter<string>();
+  title = '';
+
+  submit(): void {
+    const trimmed = this.title.trim();
+    if (!trimmed) return;
+    this.created.emit(trimmed);
+    this.title = '';
+  }
+}
+```
+</CodeBlock>
+
+<CodeBlock lang="html" title="src/app/components/task-form/task-form.component.html">
+```html
+<form class="composer" (ngSubmit)="submit()">
+  <label for="new-task">Nueva tarea</label>
+  <div class="composer-row">
+    <input id="new-task" name="title" [(ngModel)]="title"
+      placeholder="Ej. Publicar la API" maxlength="160" />
+    <button type="submit">Añadir</button>
+  </div>
+</form>
+```
+</CodeBlock>
+
+`[(ngModel)]="title"` es azúcar sintáctico para `[ngModel]="title" (ngModelChange)="title = $event"`: Angular lee `title` para pintar el input y escucha el evento `ngModelChange` para actualizarlo cuando el usuario escribe. En la parte 2 vas a sustituir esto por Reactive Forms, que te da validación declarativa — pero para un formulario de un solo campo, `ngModel` sigue siendo la herramienta correcta.
+
+## Signals: estado que sabe cuándo cambió
+
+Un Signal es un contenedor de valor que notifica a quien lo lee cuándo cambia, sin que tengas que suscribirte manualmente ni desuscribirte para evitar fugas de memoria. Se leen **como función**, lo cual es intencional: esa llamada es lo que Angular usa para rastrear qué parte de la plantilla depende de qué signal.
+
+<CodeBlock lang="typescript" title="Anatomía básica de un signal">
+```typescript
+import { signal, computed, effect } from '@angular/core';
+
+const count = signal(0);       // estado mutable
+count();                       // 0 — leer es invocar
+
+count.set(5);                  // reemplaza el valor
+count.update((current) => current + 1); // deriva del valor anterior
+
+const isPositive = computed(() => count() > 0); // se recalcula solo si `count` cambia
+
+effect(() => {
+  console.log(`count ahora es ${count()}`); // se re-ejecuta cada vez que count cambia
+});
+```
+</CodeBlock>
+
+La diferencia con una propiedad normal (`count = 0`) es que Angular **no tiene forma de saber** cuándo cambió una propiedad normal sin volver a comparar toda la plantilla (eso es, precisamente, lo que hacía el motor de *change detection* clásico). Un signal, en cambio, avisa activamente. Esto es lo que en el futuro permitirá a Angular saltarse por completo la comparación de componentes que no dependen de ningún signal que haya cambiado.
+
+## `AppComponent`: orquestación con signals
+
+<CodeBlock lang="typescript" title="src/app/app.component.ts">
+```typescript
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { Task } from './models/task';
+import { TaskApiService } from './services/task-api.service';
+import { TaskFormComponent } from './components/task-form/task-form.component';
+import { TaskListComponent } from './components/task-list/task-list.component';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [TaskFormComponent, TaskListComponent],
+  templateUrl: './app.component.html',
+})
+export class AppComponent implements OnInit {
+  private readonly taskApi = inject(TaskApiService);
+
+  readonly tasks = signal<Task[]>([]);
+  readonly isLoading = signal(true);
+  readonly errorMessage = signal('');
+  readonly pendingCount = () => this.tasks().filter((task) => !task.isCompleted).length;
+
+  ngOnInit(): void {
+    this.loadTasks();
+  }
+
+  loadTasks(): void {
+    this.isLoading.set(true);
+    this.taskApi.getAll().subscribe({
+      next: (tasks) => {
+        this.tasks.set(tasks);
+        this.isLoading.set(false);
+      },
+      error: () => {
+        this.errorMessage.set('No pudimos cargar las tareas. ¿Está encendida la API?');
+        this.isLoading.set(false);
+      },
+    });
+  }
+
+  addTask(title: string): void {
+    this.taskApi.create({ title }).subscribe({
+      next: (task) => this.tasks.update((current) => [task, ...current]),
+      error: () => this.errorMessage.set('La tarea no pudo guardarse.'),
+    });
+  }
+
+  toggleTask(task: Task): void {
+    this.taskApi.updateStatus(task.id, !task.isCompleted).subscribe({
+      next: () => this.tasks.update((current) => current.map((item) =>
+        item.id === task.id ? { ...item, isCompleted: !item.isCompleted } : item)),
+      error: () => this.errorMessage.set('No pudimos actualizar la tarea.'),
+    });
+  }
+
+  removeTask(task: Task): void {
+    this.taskApi.remove(task.id).subscribe({
+      next: () => this.tasks.update((current) => current.filter((item) => item.id !== task.id)),
+      error: () => this.errorMessage.set('No pudimos eliminar la tarea.'),
+    });
+  }
+}
+```
+</CodeBlock>
+
+Fíjate en `pendingCount`: no es un `computed`, es una función normal — y funciona igual de bien porque Angular vuelve a evaluarla en cada ciclo de detección de cambios. La diferencia práctica frente a `computed(() => ...)` es que un `computed` **cachea** su resultado y solo lo recalcula si alguno de los signals que lee cambió; una función simple se recalcula siempre. Para una lista pequeña la diferencia es imperceptible — pero es la razón por la que en la parte 7, cuando el estado crezca, vas a preferir `computed` de forma sistemática.
+
+<CodeBlock lang="html" title="src/app/app.component.html">
+```html
+<main class="shell">
+  <header class="hero">
+    <p class="eyebrow">TASKBOARD</p>
+    <h1>Menos pendientes.<br /><em>Más entregas.</em></h1>
+    <p>{{ pendingCount() }} tareas pendientes de {{ tasks().length }} en total.</p>
+  </header>
+
+  <app-task-form (created)="addTask($event)" />
+
+  @if (errorMessage()) {
+    <p class="error" role="alert">{{ errorMessage() }}</p>
+  }
+
+  <app-task-list
+    [tasks]="tasks()"
+    [isLoading]="isLoading()"
+    (toggled)="toggleTask($event)"
+    (removed)="removeTask($event)"
+  />
+</main>
+```
+</CodeBlock>
+
+## Por qué separar así, y no de otra forma
+
+`AppComponent` es el único que conoce `TaskApiService`. `TaskListComponent` y `TaskItemComponent` no saben que existe HTTP — reciben datos y emiten intenciones (`toggled`, `removed`), y es el padre quien decide qué hacer con esas intenciones. Esta regla ("los componentes de presentación no llaman servicios") es la que te permite en la parte 11 testear `TaskItemComponent` con un `Task` de mentira, sin levantar ningún backend ni mockear HTTP.
+
+## Ejercicios
+
+1. Añade un `TaskCounterComponent` que reciba `tasks: Task[]` como `@Input` y muestre "3 de 8 completadas" usando un `computed` interno derivado de un signal que reciba las tareas.
+2. Cambia `pendingCount` de método a `computed` real (necesitarás convertir `tasks` en algo que `computed` pueda leer, ya que hoy es un `Input`, no un `signal` — investiga la función `input()` basada en signals que Angular introdujo como alternativa a `@Input()`).
+3. Usa `@for (... ; track task.id; let i = $index)` para mostrar la posición de cada tarea en la lista.
+4. Añade un `@switch` para mostrar un ícono distinto según cuántas tareas pendientes hay: ninguno, pocas (1-3) o muchas (4+).
+5. Escribe un `effect()` en `AppComponent` que loguee en consola cada vez que `errorMessage` cambia de vacío a no vacío (pista: los efectos no deben mutar signals que ellos mismos leen, o se crea un bucle).
+
+## Checklist de salida
+
+- [ ] Taskboard está dividido en `AppComponent`, `TaskFormComponent`, `TaskListComponent` y `TaskItemComponent`.
+- [ ] Puedes explicar la diferencia entre `@Input`, `@Output` y `[(ngModel)]` sin mirar la tabla.
+- [ ] Sabes por qué `@for` exige `track` y qué pasaría sin una clave estable.
+- [ ] Puedes explicar la diferencia entre un signal, un `computed` y una función normal invocada desde la plantilla.
+- [ ] La aplicación sigue funcionando exactamente igual que al final de la parte 0.5, pero ahora en cuatro componentes en vez de uno.
+
+En la parte 2 vamos a reemplazar el formulario nativo por Reactive Forms con validación, y a profundizar en RxJS para manejar búsqueda y estados de carga más sofisticados.
