@@ -41,12 +41,100 @@ El recurso principal es `TaskItem`:
 
 ### Requisitos
 
-- .NET SDK 8 instalado (`dotnet --version`)
-- Node.js 20 LTS o superior
-- Angular CLI (`npm install -g @angular/cli`)
-- Un editor con soporte para C# y TypeScript
+Antes de continuar, comprueba qué tienes instalado. Si alguno de estos comandos falla o imprime una versión distinta a la esperada, sigue las instrucciones de instalación correspondientes más abajo.
 
-No necesitas Docker ni una base de datos instalada: SQLite vive en un archivo local.
+<CodeBlock lang="bash" title="Comprobación rápida">
+```bash
+dotnet --version   # esperado: 8.x.x
+node --version     # esperado: v20.x.x o superior
+npm --version
+ng version         # puede fallar si aún no instalaste Angular CLI — normal en este punto
+```
+</CodeBlock>
+
+#### .NET SDK 8
+
+- **Windows / macOS**: descarga el instalador desde [dotnet.microsoft.com/download/dotnet/8.0](https://dotnet.microsoft.com/download/dotnet/8.0) y ejecútalo.
+- **macOS con Homebrew**:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+brew install --cask dotnet-sdk
+```
+</CodeBlock>
+
+- **Linux (Ubuntu/Debian, incluye WSL)**:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+sudo dpkg -i packages-microsoft-prod.deb
+sudo apt-get update
+sudo apt-get install -y dotnet-sdk-8.0
+```
+</CodeBlock>
+
+- **Cualquier plataforma, sin permisos de administrador** (script oficial de Microsoft):
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0
+echo 'export PATH="$HOME/.dotnet:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+</CodeBlock>
+
+Confirma con `dotnet --version` — debe imprimir algo como `8.0.4xx`. Si tienes varias versiones instaladas y quieres verlas todas, usa `dotnet --list-sdks`.
+
+#### Node.js 20 LTS
+
+Instalar Node a través de un gestor de versiones (en vez del instalador del sitio oficial) te permite cambiar de versión por proyecto sin conflictos — útil en cuanto trabajes en más de un proyecto de JavaScript a la vez.
+
+- **nvm en macOS, Linux o WSL**:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc
+nvm install 20
+nvm use 20
+```
+</CodeBlock>
+
+- **Windows**: instala [nvm-windows](https://github.com/coreybutler/nvm-windows/releases), luego desde una terminal:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+nvm install 20.18.0
+nvm use 20.18.0
+```
+</CodeBlock>
+
+- **Instalador oficial, cualquier plataforma**: descarga la versión **LTS** desde [nodejs.org](https://nodejs.org).
+
+Confirma con `node --version` (debe empezar con `v20` o superior) y `npm --version` (viene incluido con Node, no se instala aparte).
+
+#### Angular CLI
+
+Con Node ya instalado:
+
+<CodeBlock lang="bash" title="Terminal">
+```bash
+npm install -g @angular/cli
+ng version
+```
+</CodeBlock>
+
+`ng version` no solo confirma que la instalación funcionó — también te dice qué versión de Angular usará `ng new` por defecto, y qué versión de Node y del propio CLI tienes activas.
+
+#### Un editor con soporte para C# y TypeScript
+
+Cualquier editor moderno sirve. Si usas Visual Studio Code, dos extensiones cubren todo lo que necesitas en este curso:
+
+- **C# Dev Kit** (de Microsoft) — IntelliSense, depuración y ejecución de tests para el backend .NET.
+- **Angular Language Service** (de Angular) — autocompletado y chequeo de tipos dentro de las plantillas HTML de Angular.
+
+No necesitas Docker ni una base de datos instalada para este capítulo: SQLite vive en un archivo local. Sí los necesitarás más adelante — Docker aparece en la parte 6 (Redis) y en la parte 12 (contenedores completos).
 
 ## 1. Crea la solución
 
